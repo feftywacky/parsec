@@ -4,7 +4,7 @@
 #include <list>
 #include <unordered_map>
 
-#include "order.hpp"
+class Order;
 
 class PriceLevel {
 private:
