@@ -16,7 +16,7 @@ Run:
 ./main
 ```
 
-To clean:
+Clean:
 ```
 make clean
 ```
