@@ -19,7 +19,7 @@ set(ORDER_BOOK_SOURCES
 )
 
 # Create executable
-add_executable(main 
+add_executable(parsec 
     main.cpp
     ${ORDER_BOOK_SOURCES}
 )

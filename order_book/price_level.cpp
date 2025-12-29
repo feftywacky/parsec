@@ -6,14 +6,14 @@
 #include "price_level.hpp"
 #include "order.hpp"
 
-PriceLevel::PriceLevel(double price, uint32_t quantity) : price(price), quantity(quantity){}
+PriceLevel::PriceLevel(int64_t price, int64_t total_size) : price(price), total_size(total_size){}
 
 PriceLevel::~PriceLevel(){}
 
 void PriceLevel::add_order(Order* order)
 {
     orders.push_back(order);
-    order_map[order->order_id]= --orders.end();   
+    order_map[order->order_id]= --orders.end(); 
 }
 
 void PriceLevel::remove_order(uint64_t order_id)
@@ -26,24 +26,24 @@ void PriceLevel::remove_order(uint64_t order_id)
     }
 }
 
-void PriceLevel::set_price(double new_price)
+void PriceLevel::set_price(int64_t new_price)
 {
     price = new_price;
 }
 
-void PriceLevel::set_quantity(uint32_t new_quantity)
+void PriceLevel::set_total_size(int64_t new_total_size)
 {
-    quantity = new_quantity;
+    total_size = new_total_size;
 }
 
-double PriceLevel::get_price()
+int64_t PriceLevel::get_price()
 {
     return price;
 }
 
-double PriceLevel::get_quantity()
+int64_t PriceLevel::get_total_size()
 {
-    return quantity;
+    return total_size;
 }
 
 Order* PriceLevel::get_first_order()

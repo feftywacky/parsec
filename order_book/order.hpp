@@ -7,8 +7,8 @@
 struct Order {
     uint64_t order_id;
     Side side;
-    double price;
-    double original_size;
-    double remaining_size;
+    int64_t price;
+    int64_t original_size;
+    int64_t remaining_size;
     uint64_t timestamp;
 };

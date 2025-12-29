@@ -1,5 +1,5 @@
 # Parsec
-backtesting engine for hyperliquid derivatives
+backtesting engine for hyperliquid perpetuals
 
 ## Get Started
 
@@ -8,15 +8,15 @@ Compile:
 mkdir build
 cd build
 cmake ..
-make
+cmake --build .
 ```
 
 Run:
 ```
-./main
+./parsec
 ```
 
 Clean:
 ```
-make clean
+cmake --build . --target clean
 ```
