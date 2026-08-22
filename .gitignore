@@ -1,2 +1,10 @@
-.vscode
-/build
+/build/
+target/
+*.o
+*.a
+.vscode/
+.idea/
+.DS_Store
+.parsec/
+keystore*
+*.key

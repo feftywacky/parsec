@@ -1,182 +1,79 @@
-#include <iostream>
-#include <cassert>
-#include <ctime>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <string>
 
-#include "order_book/order.hpp"
-#include "order_book/price_level.hpp"
-#include "order_book/side.hpp"
-#include "order_book/units.hpp"
+#include "app/cli_setup.hpp"
+#include "app/config.hpp"
+#include "app/engine.hpp"
+#include "ui/app_window.hpp"
 
-void test_order_creation() {
-    std::cout << "Testing Order creation..." << std::endl;
+namespace {
 
-    using Cfg = ob::BtcPerpConfig;
-    
-    Order order1 = {
-        .order_id = 1001,
-        .side = BID,
-        .price = 50000 * Cfg::price_scale,
-        .original_size = 150000,
-        .remaining_size = 150000,
-        .timestamp = static_cast<uint64_t>(std::time(nullptr))
-    };
-    
-    assert(order1.order_id == 1001);
-    assert(order1.side == BID);
-    assert(order1.price == 50000 * Cfg::price_scale);
-    assert(order1.original_size == 150000);
-    assert(order1.remaining_size == 150000);
-    
-    std::cout << "✓ Order creation test passed" << std::endl;
+void print_usage() {
+    std::fputs(
+        "usage: parsec [--testnet|--mainnet] [--confirm-mainnet=MAINNET] "
+        "[--config=PATH]\n"
+        "       parsec setup [--testnet|--mainnet] [--print-approval] [--signature=0x...]\n",
+        stderr);
 }
 
-void test_price_level_add_remove() {
-    std::cout << "\nTesting PriceLevel add/remove operations..." << std::endl;
+}  // namespace
 
-    using Cfg = ob::BtcPerpConfig;
-    
-    // Create a price level at $50,000
-    PriceLevel level(50000 * Cfg::price_scale, 0);
-    
-    // Create orders
-    Order order1 = {1001, BID, 50000 * Cfg::price_scale, 100000, 100000, 1000};
-    Order order2 = {1002, BID, 50000 * Cfg::price_scale, 200000, 200000, 1001};
-    Order order3 = {1003, BID, 50000 * Cfg::price_scale, 50000, 50000, 1002};
-    
-    // Test adding orders
-    level.add_order(&order1);
-    level.add_order(&order2);
-    level.add_order(&order3);
-    
-    Order* first = level.get_first_order();
-    assert(first != nullptr);
-    assert(first->order_id == 1001);
-    std::cout << "✓ First order is correct (FIFO)" << std::endl;
-    
-    // Test removing middle order
-    level.remove_order(1002);
-    first = level.get_first_order();
-    assert(first->order_id == 1001);
-    std::cout << "✓ Remove middle order - first order still correct" << std::endl;
-    
-    // Remove first order
-    level.remove_order(1001);
-    first = level.get_first_order();
-    assert(first != nullptr);
-    assert(first->order_id == 1003);
-    std::cout << "✓ Remove first order - new first is correct" << std::endl;
-    
-    // Remove last order
-    level.remove_order(1003);
-    first = level.get_first_order();
-    assert(first == nullptr || first->order_id != 1003);
-    std::cout << "✓ All orders removed successfully" << std::endl;
-}
+int main(int argc, char** argv) {
+    // `parsec setup` is a distinct CLI mode (docs/06 §2), not a flag on the trading terminal --
+    // dispatch before any of the terminal's own option parsing runs.
+    if (argc > 1 && std::strcmp(argv[1], "setup") == 0)
+        return pc::app::cli::run_setup(argc, argv);
 
-void test_price_level_getters_setters() {
-    std::cout << "\nTesting PriceLevel getters/setters..." << std::endl;
+    bool want_mainnet = true;
+    const char* confirm_mainnet = "";
+    const char* config_path_override = nullptr;
 
-    using Cfg = ob::BtcPerpConfig;
-    
-    PriceLevel level(50000 * Cfg::price_scale, 100);
-    
-    assert(level.get_price() == 50000 * Cfg::price_scale);
-    assert(level.get_total_size() == 100);
-    std::cout << "✓ Initial price and total size correct" << std::endl;
-    
-    level.set_price(50050 * Cfg::price_scale);
-    assert(level.get_price() == 50050 * Cfg::price_scale);
-    std::cout << "✓ Price setter works" << std::endl;
-    
-    level.set_total_size(150);
-    assert(level.get_total_size() == 150);
-    std::cout << "✓ Total size setter works" << std::endl;
-}
-
-void test_multiple_orders_fifo() {
-    std::cout << "\nTesting FIFO order priority..." << std::endl;
-
-    using Cfg = ob::BtcPerpConfig;
-    
-    PriceLevel level(50000 * Cfg::price_scale, 0);
-    
-    // Create 5 orders with different timestamps
-    Order orders[5];
-    for (int i = 0; i < 5; i++) {
-        orders[i] = {
-            static_cast<uint64_t>(2000 + i),
-            BID,
-            50000 * Cfg::price_scale,
-            100000,
-            100000,
-            static_cast<uint64_t>(1000 + i)
-        };
-        level.add_order(&orders[i]);
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--mainnet") == 0) {
+            want_mainnet = true;
+        } else if (std::strcmp(argv[i], "--testnet") == 0) {
+            want_mainnet = false;
+        } else if (std::strncmp(argv[i], "--confirm-mainnet=", 18) == 0) {
+            confirm_mainnet = argv[i] + 18;
+        } else if (std::strncmp(argv[i], "--config=", 9) == 0) {
+            config_path_override = argv[i] + 9;
+        } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
+            print_usage();
+            return 0;
+        } else {
+            std::fprintf(stderr, "parsec: unrecognized argument '%s'\n", argv[i]);
+            print_usage();
+            return 2;
+        }
     }
-    
-    // Verify FIFO - first order should be order 2000
-    Order* first = level.get_first_order();
-    assert(first->order_id == 2000);
-    std::cout << "✓ FIFO ordering maintained" << std::endl;
-    
-    // Remove orders out of order and verify
-    level.remove_order(2002); // Remove middle
-    level.remove_order(2000); // Remove first
-    
-    first = level.get_first_order();
-    assert(first->order_id == 2001);
-    std::cout << "✓ FIFO maintained after removals" << std::endl;
-}
 
-void test_remove_nonexistent_order() {
-    std::cout << "\nTesting removal of non-existent order..." << std::endl;
+    const std::string config_path =
+        config_path_override ? config_path_override : pc::app::Config::default_path();
+    pc::app::Config cfg = pc::app::Config::load(config_path);
+    const bool using_default_keystore =
+        cfg.keystore_path == pc::app::Config::default_keystore_path(true) ||
+        cfg.keystore_path == pc::app::Config::default_keystore_path(false);
 
-    using Cfg = ob::BtcPerpConfig;
-    
-    PriceLevel level(50000 * Cfg::price_scale, 0);
-    Order order1 = {3001, BID, 50000 * Cfg::price_scale, 100000, 100000, 1000};
-    level.add_order(&order1);
-    
-    // Try to remove an order that doesn't exist - should not crash
-    level.remove_order(9999);
-    
-    Order* first = level.get_first_order();
-    assert(first != nullptr);
-    assert(first->order_id == 3001);
-    std::cout << "✓ Removing non-existent order doesn't affect existing orders" << std::endl;
-}
+    // Network selection is an operational CLI choice: mainnet is the default and --testnet is
+    // the explicit override. The typed confirmation remains a separate safety signal for an
+    // authenticated mainnet session; without it, public mainnet market data still opens but an
+    // existing keystore is deliberately not handed to the engine.
+    cfg.mainnet = want_mainnet;
+    if (using_default_keystore)
+        cfg.keystore_path = pc::app::Config::default_keystore_path(want_mainnet);
+    if (want_mainnet && !pc::app::MainnetGate::allowed(cfg, confirm_mainnet))
+        cfg.keystore_path.clear();
 
-void test_units_tick_config() {
-    std::cout << "\nTesting price/size tick+scale config..." << std::endl;
-
-    using Cfg = ob::BtcPerpConfig;
-
-    // Check that 1 unit corresponds to the expected decimal increments.
-    // With sz_decimals=5 => size_scale=1e5 => 1 size unit = 0.00001 BTC
-    assert(Cfg::size_to_double(1) == 0.00001);
-    // With max_price_decimals=1 => price_scale=10 => 1 price unit = 0.1
-    assert(Cfg::price_to_double(1) == 0.1);
-
-    std::cout << "✓ Tick/scale parsing and alignment checks passed" << std::endl;
-}
-
-int main()
-{
-    std::cout << "=== Running Order Book Test Suite ===" << std::endl;
-    
-    try {
-        test_order_creation();
-        test_price_level_add_remove();
-        test_price_level_getters_setters();
-        test_multiple_orders_fifo();
-        test_remove_nonexistent_order();
-        test_units_tick_config();
-        
-        std::cout << "\n=== All tests passed! ✓ ===" << std::endl;
-    } catch (const std::exception& e) {
-        std::cerr << "\n❌ Test failed with exception: " << e.what() << std::endl;
+    // Engine (and the market snapshot it holds) is heap-allocated deliberately: it embeds
+    // several fixed-size 512-asset snapshots and is far too large to live on the default
+    // thread stack (~700 MB — a stack-allocated Engine segfaults on startup).
+    auto engine = std::make_unique<pc::app::Engine>(cfg);
+    if (!engine->start()) {
+        std::fputs("Could not start Parsec network engine.\n", stderr);
         return 1;
     }
-    
-    return 0;
+
+    return pc::ui::AppWindow(*engine).run();
 }
