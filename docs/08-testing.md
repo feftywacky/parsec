@@ -173,3 +173,28 @@ schedule.
 - UI pixel output. Panels are thin readers over snapshots; the snapshots are tested instead.
 - Third-party library internals (ImGui, ImPlot, tokio). Pinned versions, and upgrades get a
   manual smoke pass.
+
+## Slow security tests
+
+Two tests run real SENSITIVE-tier Argon2id derivations (~3.5 s each) and are therefore
+`#[ignore]`d so the default loop stays fast. Run them before changing anything in
+`signer::keystore`, `ffi::setup`, or the unlock path:
+
+```sh
+cargo test --release -- --ignored
+```
+
+- `ffi::setup::tests::keystore_round_trips_from_seal_through_unlock` — seal, 0600/0700
+  permissions, refusal to overwrite, header peek, and unlock back to the approved agent.
+- `ffi::auth_tests::unlock_reports_failure_then_success_and_zeroes_the_passphrase` — the
+  state machine the unlock dialog drives, including passphrase-buffer zeroing.
+
+## Still unverified
+
+The one thing no test here covers is a full authenticated round trip on a **funded** account:
+`approveAgent` accepted, keystore written, order placed and filled. The onboarding path has
+been exercised end to end against live testnet up to the venue's own reply — the venue
+recovered the same signer address parsec did, which pins the EIP-712 digest — but it rejected
+with "Must deposit before performing actions", so the accepted-approval branch is untested.
+Do this on testnet with a funded account before trusting any of it, together with the
+agent-cannot-withdraw check that 06 §1 calls the highest-value test in the project.

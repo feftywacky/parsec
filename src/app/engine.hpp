@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -60,8 +61,58 @@ public:
     // (docs/07 Phase 7 requirement 5), so it has to reach the UI rather than being assumed.
     [[nodiscard]] bool mainnet() const noexcept { return mainnet_; }
 
+    // The configured risk limits (docs/02 §6.5). The order ticket gates on these before it
+    // pushes a PlaceOrder command, so it must read the same values this engine was built with
+    // rather than default-constructing risk::Limits{}.
+    [[nodiscard]] const risk::Limits& limits() const noexcept { return config_.limits; }
+
     [[nodiscard]] uint32_t active_asset() const noexcept {
         return active_asset_.load(std::memory_order_relaxed);
+    }
+
+    // -- account connection (docs/06 §2). UI-thread safe: all three go straight to the
+    // FFI, which serializes internally, and none of them touch engine-thread state.
+
+    // PC_AUTH_* -- NO_KEYSTORE (connect an account), LOCKED, UNLOCKING, UNLOCKED, FAILED,
+    // EXPIRED (a keystore exists but its agent approval lapsed; no passphrase opens it).
+    [[nodiscard]] int auth_status() const noexcept {
+        return ffi_ != nullptr ? pc_auth_status(ffi_) : PC_AUTH_NO_KEYSTORE;
+    }
+
+    // Starts an unlock attempt and returns immediately -- Argon2id costs ~3.5s (docs/06 §3),
+    // far too long to block a frame on, so the caller polls auth_status(). `passphrase` is a
+    // WRITABLE buffer and is zeroed by the callee before it returns.
+    bool unlock(char* passphrase) noexcept {
+        return ffi_ != nullptr && pc_unlock(ffi_, passphrase) == 0;
+    }
+
+    // Tell the engine about a keystore written after startup (the in-app connect flow).
+    bool set_keystore_path(const std::string& path) noexcept {
+        return ffi_ != nullptr && pc_set_keystore_path(ffi_, path.c_str()) == 0;
+    }
+
+    // Deletes every local keystore and returns the engine to its fresh-install state, so the
+    // next frame reports PC_AUTH_NO_KEYSTORE and the connect flow opens. Returns the number
+    // of files removed, or -1 if refused (already unlocked) or a delete failed.
+    //
+    // Local only: the agent approval still stands at the venue until it lapses on its own.
+    // parsec cannot revoke it, since revoking needs the master key it never stores.
+    int reset_accounts() noexcept {
+        return ffi_ != nullptr ? pc_reset_accounts(ffi_) : -1;
+    }
+
+    // Last FFI-side error string, for surfacing why a reset or unlock was refused.
+    [[nodiscard]] std::string last_error() const noexcept {
+        char buffer[256]{};
+        if (ffi_ == nullptr || pc_last_error(ffi_, buffer, sizeof(buffer)) < 0)
+            return {};
+        return buffer;
+    }
+
+    // Path of the keystore this engine would unlock. Non-empty even when the file does not
+    // exist yet, which is what lets the UI tell the user where setup will write it.
+    [[nodiscard]] const std::string& keystore_path() const noexcept {
+        return config_.keystore_path;
     }
 
 private:
@@ -106,6 +157,11 @@ private:
     portfolio::PositionBook positions_{};
     pc_account account_{};
     bool account_valid_{};
+    pc_asset_data asset_data_{};
+    uint32_t asset_data_asset_{PC_ASSET_NONE};
+    bool asset_data_valid_{};
+    pc_fee_rates fee_rates_{};
+    bool fee_rates_valid_{};
     exec::OrderStateBook orders_{};
     std::vector<pc_event> poll_buffer_{};
     char active_coin_[PC_COIN_LEN]{};
@@ -114,9 +170,33 @@ private:
     // subscribe_interval().
     uint64_t subscribed_intervals_{};
 
-    // Last WebSocket ping/pong round trip on the market socket, microseconds. Fed by the
-    // pong-carried PC_EV_CONN heartbeat, republished to the UI in every SafetySnapshot.
+    // Last WebSocket ping/pong round trip per socket, microseconds. Fed by the pong-carried
+    // PC_EV_CONN heartbeat, republished to the UI in every SafetySnapshot.
     uint32_t market_rtt_us_{};
+    uint32_t user_rtt_us_{};
+
+    // Local (this-process) latency accounting, republished in every SafetySnapshot. See
+    // SafetySnapshot's own comments for what each figure means. EWMAs are kept in whole
+    // microseconds with a 1/8 smoothing factor -- integer-only, since this runs on the hot
+    // loop and a float here would buy nothing but a rounding question.
+    uint32_t engine_tick_us_{};
+    uint32_t engine_tick_max_us_{};  // reset on each publish, so it is a per-window worst case
+    uint32_t engine_batch_events_{};
+    uint32_t engine_cmd_us_{};
+    // Set by drain_ui_commands() when it pops a command; folded into engine_cmd_us_ there.
+    static constexpr uint32_t kLatencyEwmaShift = 3;  // alpha = 1/8
+    static uint32_t ewma_us(uint32_t previous, uint64_t sample_us) noexcept {
+        const int64_t sample = static_cast<int64_t>(
+            sample_us > 0x7FFF'FFFFULL ? 0x7FFF'FFFFULL : sample_us);
+        if (previous == 0)
+            return static_cast<uint32_t>(sample);
+        // Arithmetic shift on a signed difference, so the EWMA converges downward as well as
+        // upward -- an unsigned >> on a negative delta would latch the maximum forever.
+        const int64_t next =
+            static_cast<int64_t>(previous) +
+            ((sample - static_cast<int64_t>(previous)) >> kLatencyEwmaShift);
+        return next < 0 ? 0U : static_cast<uint32_t>(next);
+    }
 
     // Price granularity currently in force on the l2Book subscriptions. -1/0 == the venue's
     // native granularity, which is what a fresh subscription starts at.
@@ -133,6 +213,8 @@ private:
     risk::DeadMansSwitch dms_{};
     uint64_t dms_deadline_ms_{};  // 0 until the first heartbeat goes out
     bool dms_active_{};
+    bool dms_unavailable_{};  // venue-level eligibility rejection; do not retry every heartbeat
+    pc_req_id dms_req_id_{};  // correlates the venue's eligibility error to the heartbeat action
 
     risk::KillSwitch kill_switch_{};
     risk::RateBudget rate_budget_{};
@@ -146,6 +228,8 @@ private:
     portfolio::AccountState account_state_{};
     std::vector<uint32_t> reconcile_batch_{};  // assets touched by the snapshot batch in flight
     uint64_t last_reconcile_fetch_ms_{};
+    uint64_t last_fee_rates_fetch_ms_{};
+    uint64_t last_asset_data_fetch_ms_{};
     uint32_t reconcile_divergence_count_{};
     bool reconcile_alarm_{};
 };

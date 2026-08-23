@@ -420,12 +420,5 @@ bool Config::save(const std::string& path) const noexcept {
     return file.good();
 }
 
-bool MainnetGate::allowed(const Config& cfg, const char* typed_confirmation) noexcept {
-    if (!cfg.mainnet)
-        return false;
-    if (typed_confirmation == nullptr)
-        return false;
-    return std::strcmp(typed_confirmation, kRequiredConfirmation) == 0;
-}
 
 }  // namespace pc::app

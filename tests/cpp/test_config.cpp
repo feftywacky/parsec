@@ -107,39 +107,3 @@ TEST_CASE("Config::load: wrong-typed field falls back to that field's default, n
     CHECK(cfg.order_ack_timeout_ms == 4242);           // sibling field still parses correctly
 }
 
-// --- MainnetGate (docs/06 §5.7 rule 7, docs/07 Phase 7 #5) ----------------------------------
-
-TEST_CASE("MainnetGate: refuses with neither signal") {
-    Config cfg = Config::defaults();
-    cfg.mainnet = false;
-    CHECK_FALSE(MainnetGate::allowed(cfg, ""));
-    CHECK_FALSE(MainnetGate::allowed(cfg, "MAINNET"));
-}
-
-TEST_CASE("MainnetGate: config flag alone is not enough") {
-    Config cfg = Config::defaults();
-    cfg.mainnet = true;
-    CHECK_FALSE(MainnetGate::allowed(cfg, ""));
-    CHECK_FALSE(MainnetGate::allowed(cfg, nullptr));
-}
-
-TEST_CASE("MainnetGate: typed confirmation alone (no config flag) is not enough") {
-    Config cfg = Config::defaults();
-    cfg.mainnet = false;
-    CHECK_FALSE(MainnetGate::allowed(cfg, "MAINNET"));
-}
-
-TEST_CASE("MainnetGate: both signals together allow it") {
-    Config cfg = Config::defaults();
-    cfg.mainnet = true;
-    CHECK(MainnetGate::allowed(cfg, "MAINNET"));
-}
-
-TEST_CASE("MainnetGate: confirmation must match exactly, not case-insensitively or as a prefix") {
-    Config cfg = Config::defaults();
-    cfg.mainnet = true;
-    CHECK_FALSE(MainnetGate::allowed(cfg, "mainnet"));
-    CHECK_FALSE(MainnetGate::allowed(cfg, "MAIN"));
-    CHECK_FALSE(MainnetGate::allowed(cfg, "MAINNET "));
-    CHECK_FALSE(MainnetGate::allowed(cfg, "I confirm MAINNET"));
-}

@@ -1,24 +1,20 @@
-// `parsec setup` (docs/06 §2). The onboarding flow, in the order the master key's exposure
-// window is minimized:
+// `parsec setup` (docs/06 §2) -- the one-time flow that connects an account.
 //
-//   1. generate a fresh agent keypair                    -- needs pc_agent_generate
-//   2. EITHER prompt for the master private key and sign  -- needs pc_agent_approve_with_master
-//      locally, zeroing it the instant signing returns,
-//      OR (--print-approval) print the digest to sign     -- needs pc_agent_approve_digest
-//      offline and stop, OR (--signature) submit an        -- needs pc_agent_approve_with_sig
-//      already-obtained signature -- the master key never touches this process in either of
-//      the last two paths, which is the entire point of §2's "alternative for the paranoid".
-//   3. prompt for a keystore passphrase (twice, must match)
-//   4. seal + write ~/.parsec/keystore-<network>.json, mode 0600 -- needs pc_agent_seal_keystore
+// parsec never stores the MetaMask master key. It approves an *agent wallet* (docs/06 §1),
+// which can trade the account but cannot withdraw from it, and stores only that agent's key,
+// encrypted. So this command's whole job is: generate an agent, get the master key to approve
+// it exactly once, and seal the result.
 //
-// None of the four `pc_agent_*` entry points above exist in include/parsec/parsec.h today.
-// That header is frozen and out of scope for this pass, and rust/ is being actively changed by
-// another agent concurrently -- inventing ABI additions here would be guessing at a contract
-// someone else is mid-negotiation on. So: everything that does NOT require crossing the FFI
-// boundary (argument parsing, prompting, passphrase confirmation, secure zeroing, the ordering
-// of steps, never letting a secret touch a log line or a CLI argument) is fully implemented and
-// exercised below. Every point that needs a Rust call stops with an explicit, named list of
-// what is missing rather than fabricating a call that would silently do nothing or crash.
+// One path: prompt for the master key, sign in-process, zero it immediately. The key exists
+// here for the duration of one signature and is never written, logged, or passed as an
+// argument (where it would land in shell history and `ps` output).
+//
+// Every secret read here goes into a fixed caller-owned buffer, never a std::string (which
+// offers no zeroing guarantee and may leave copies behind on reallocation), and is zeroed
+// through a volatile pointer -- docs/06 §4 measured clang -O2 deleting a plain memset on a
+// buffer about to go out of scope. The master-key and passphrase buffers are additionally
+// zeroed by the Rust side before pc_setup_sign_with_master returns, so the secret dies even
+// if this file's own zeroing were ever removed.
 #include "app/cli_setup.hpp"
 
 #include <termios.h>
@@ -28,6 +24,9 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+
+#include "app/config.hpp"
+#include "parsec/parsec.h"
 
 namespace pc::app::cli {
 namespace {
@@ -39,6 +38,20 @@ void secure_zero(char* buf, size_t len) noexcept {
     for (size_t i = 0; i < len; ++i)
         p[i] = 0;
 }
+
+// RAII wipe for a secret buffer, so an early `return` on an error path cannot skip the zeroing.
+// Every secret in this file is owned by one of these.
+class ScopedSecret {
+public:
+    ScopedSecret(char* buf, size_t len) noexcept : buf_(buf), len_(len) {}
+    ~ScopedSecret() { secure_zero(buf_, len_); }
+    ScopedSecret(const ScopedSecret&) = delete;
+    ScopedSecret& operator=(const ScopedSecret&) = delete;
+
+private:
+    char* buf_;
+    size_t len_;
+};
 
 // Reads one line from stdin with terminal echo disabled, into a fixed caller-owned buffer --
 // deliberately not std::string, which offers no zeroing guarantee and may reallocate/copy the
@@ -80,77 +93,96 @@ bool read_secret_line(const char* prompt, char* out, size_t cap) noexcept {
 
 void print_usage() {
     std::fputs(
-        "usage: parsec setup [--testnet|--mainnet] [--print-approval] [--signature=0x...] "
-        "[--agent-name=NAME]\n"
+        "usage: parsec setup [--testnet] [--agent-name=NAME] [--keystore=PATH]\n"
         "\n"
-        "  (no flags)          interactive: prompts for the MetaMask master private key,\n"
-        "                      signs approveAgent locally, zeroes the key immediately.\n"
-        "  --print-approval    prints the approveAgent EIP-712 digest and stops -- sign it\n"
-        "                      offline (hardware wallet, air-gapped machine, MetaMask) and\n"
-        "                      hand the signature back via --signature. The master key never\n"
-        "                      touches this process in this path.\n"
-        "  --signature=0x...   submits a signature obtained offline via --print-approval.\n"
-        "  --testnet           target testnet instead of mainnet.\n",
-        stdout);
+        "Approves an agent wallet and writes an encrypted keystore. Prompts for the MetaMask\n"
+        "private key, uses it for one signature, and zeroes it immediately.\n"
+        "\n"
+        "Runs against mainnet by default; pass --testnet for testnet.\n"
+        "\n"
+        "You normally do not need this command -- just run `parsec` and it will offer to\n"
+        "connect an account on first launch.\n"
+        , stdout);
 }
 
-// Named exactly for what is missing, not a generic "not implemented" -- see this file's header
-// comment and the report from this pass for the intended signature of each.
-void report_missing_abi() {
+// Prints the handle's own error message. Never contains key material: the Rust side builds
+// every one of these from fixed strings and non-secret values (docs/06 §5 rule 2).
+void report(pc_setup* setup, const char* what) {
+    char err[256]{};
+    if (pc_setup_last_error(setup, err, sizeof(err)) > 0 && err[0] != '\0')
+        std::fprintf(stderr, "parsec setup: %s: %s\n", what, err);
+    else
+        std::fprintf(stderr, "parsec setup: %s\n", what);
+}
+
+// Prompt for a passphrase twice, seal, and write. Split out because both approval paths
+// (pasted master key, and signed-elsewhere) finish identically once the agent is approved.
+int seal_and_write(pc_setup* setup, const std::string& keystore_path) {
     std::fputs(
-        "\nparsec setup cannot complete yet: the agent-wallet and keystore primitives that\n"
-        "already exist in rust/src/signer/{agent,keystore}.rs are not reachable from C++ --\n"
-        "include/parsec/parsec.h has no pc_agent_*/pc_keystore_* entry points. Needed:\n"
-        "\n"
-        "  pc_agent_generate(pc_engine*, uint8_t agent_addr_out[20])\n"
-        "      -- wraps agent::generate()/derive_address(); the private key stays inside the\n"
-        "         Rust engine handle (never crosses the FFI boundary, docs/06 §5 rule 1) until\n"
-        "         one of the approve_* calls below consumes it.\n"
-        "\n"
-        "  pc_agent_approve_digest(pc_engine*, const char* agent_name, uint64_t "
-        "valid_until_ms,\n"
-        "                           uint8_t digest_out[32])\n"
-        "      -- wraps ApproveAgentRequest::digest() for the --print-approval path.\n"
-        "\n"
-        "  pc_agent_approve_with_master(pc_engine*, const uint8_t master_sk[32],\n"
-        "                                const char* agent_name, uint64_t valid_until_ms)\n"
-        "      -- wraps ApproveAgentRequest::sign() + POST /exchange; zeroes master_sk\n"
-        "         internally the instant signing returns.\n"
-        "\n"
-        "  pc_agent_approve_with_signature(pc_engine*, const uint8_t signature[65],\n"
-        "                                   const char* agent_name, uint64_t valid_until_ms)\n"
-        "      -- submits the approveAgent action with a signature obtained offline.\n"
-        "\n"
-        "  pc_agent_seal_keystore(pc_engine*, const char* passphrase, const char* out_path)\n"
-        "      -- wraps keystore::Keystore::seal() for the just-approved agent key and writes\n"
-        "         it to `out_path` with mode 0600.\n"
-        "\n"
-        "This binary already prompts for every input in the right order, never echoes a\n"
-        "passphrase, and zeroes every secret buffer before returning -- wiring the calls above\n"
-        "in is a small, mechanical change once they exist; nothing here needs to change shape.\n",
-        stderr);
+        "\nChoose a passphrase for the local keystore. This encrypts the agent key on disk;\n"
+        "it is asked for once per session and is never stored anywhere.\n",
+        stdout);
+
+    char pass1[256]{};
+    char pass2[256]{};
+    ScopedSecret wipe1(pass1, sizeof(pass1));
+    ScopedSecret wipe2(pass2, sizeof(pass2));
+
+    const bool ok1 = read_secret_line("Keystore passphrase: ", pass1, sizeof(pass1));
+    const bool ok2 = ok1 && read_secret_line("Confirm keystore passphrase: ", pass2, sizeof(pass2));
+    if (!ok1 || !ok2 || std::strcmp(pass1, pass2) != 0) {
+        std::fputs("parsec setup: passphrases did not match (or could not be read)\n", stderr);
+        return 1;
+    }
+
+    // Argon2id at the SENSITIVE tier (docs/06 §3) -- ~3.5s, deliberately. Say so, or it looks
+    // like a hang.
+    std::fputs("\nEncrypting keystore (Argon2id, ~3.5s)...\n", stdout);
+    std::fflush(stdout);
+    if (pc_setup_write_keystore(setup, pass1, keystore_path.c_str()) != 0) {
+        report(setup, "could not write the keystore");
+        std::fputs(
+            "\nThe agent WAS approved at the venue even though the keystore was not written.\n"
+            "Re-run `parsec setup` to approve a fresh agent -- the un-stored one is\n"
+            "unreachable (its key existed only in this process) and expires on its own.\n",
+            stderr);
+        return 1;
+    }
+
+    char agent[PC_ADDR_STR_CAP]{};
+    char master[PC_ADDR_STR_CAP]{};
+    pc_setup_agent_address(setup, agent, sizeof(agent));
+    pc_setup_master_address(setup, master, sizeof(master));
+    std::fprintf(stdout,
+                 "\nDone.\n"
+                 "  account (master): %s\n"
+                 "  agent (signs):    %s\n"
+                 "  keystore:         %s\n"
+                 "  agent expires:    %llu (epoch ms)\n"
+                 "\n"
+                 "The agent can trade this account but cannot withdraw from it. To revoke it,\n"
+                 "approve a new agent with the same name -- from MetaMask on a phone if need\n"
+                 "be; that is faster than getting back to a laptop.\n",
+                 master, agent, keystore_path.c_str(),
+                 static_cast<unsigned long long>(pc_setup_valid_until_ms(setup)));
+    return 0;
 }
 
 }  // namespace
 
 int run_setup(int argc, char** argv) noexcept {
-    bool print_approval = false;
     bool mainnet = true;
-    std::string signature_hex;
     std::string agent_name;
+    std::string keystore_override;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view a = argv[i];
-        if (a == "--print-approval") {
-            print_approval = true;
-        } else if (a == "--mainnet") {
-            mainnet = true;
-        } else if (a == "--testnet") {
+        if (a == "--testnet") {
             mainnet = false;
-        } else if (a.rfind("--signature=", 0) == 0) {
-            signature_hex = std::string(a.substr(std::strlen("--signature=")));
         } else if (a.rfind("--agent-name=", 0) == 0) {
             agent_name = std::string(a.substr(std::strlen("--agent-name=")));
+        } else if (a.rfind("--keystore=", 0) == 0) {
+            keystore_override = std::string(a.substr(std::strlen("--keystore=")));
         } else if (a == "--help" || a == "-h") {
             print_usage();
             return 0;
@@ -161,66 +193,73 @@ int run_setup(int argc, char** argv) noexcept {
         }
     }
 
-    std::fprintf(stdout, "parsec setup -- network: %s\n", mainnet ? "mainnet" : "testnet");
-    if (!agent_name.empty())
-        std::fprintf(stdout, "agent name override: %s\n", agent_name.c_str());
+    const std::string keystore_path =
+        keystore_override.empty() ? Config::default_keystore_path(mainnet) : keystore_override;
 
-    if (print_approval) {
-        // Step 1 (pc_agent_generate) then step 2's digest (pc_agent_approve_digest) would run
-        // here; the master key is never involved in this branch at all.
+    // Step 1: a fresh agent keypair, always. Its private key stays inside `setup` and is never
+    // readable from here (docs/06 §5 rule 1).
+    pc_setup* setup =
+        pc_setup_begin(mainnet, agent_name.empty() ? nullptr : agent_name.c_str(), 0);
+    if (setup == nullptr) {
+        std::fputs("parsec setup: could not start onboarding\n", stderr);
+        return 1;
+    }
+    struct Free {
+        pc_setup* s;
+        ~Free() { pc_setup_free(s); }
+    } free_setup{setup};
+
+    char agent_address[PC_ADDR_STR_CAP]{};
+    char signed_name[192]{};
+    pc_setup_agent_address(setup, agent_address, sizeof(agent_address));
+    pc_setup_agent_name(setup, signed_name, sizeof(signed_name));
+
+    std::fprintf(stdout,
+                 "parsec setup -- network: %s\n"
+                 "  new agent address: %s\n"
+                 "  agent name:        %s\n"
+                 "  keystore:          %s\n\n",
+                 mainnet ? "mainnet" : "testnet", agent_address, signed_name,
+                 keystore_path.c_str());
+
+    // Steps 2-5 of docs/06 §2. The master key lives in this process for the duration of one
+    // signature. Read into a fixed buffer -- never a CLI argument, where it would land in
+    // shell history and `ps` output.
+    {
         std::fputs(
-            "--print-approval: would generate a fresh agent key and print the\n"
-            "approveAgent EIP-712 digest to sign offline.\n",
+            "The master private key is used once, to approve the agent, and is never stored.\n"
+            "It is not echoed, not logged, and zeroed the instant the signature is produced.\n",
             stdout);
-        report_missing_abi();
-        return 3;
+        char master_key_hex[160]{};
+        ScopedSecret wipe(master_key_hex, sizeof(master_key_hex));
+        if (!read_secret_line("Master private key (hex): ", master_key_hex,
+                              sizeof(master_key_hex))) {
+            std::fputs("parsec setup: failed to read master private key\n", stderr);
+            return 1;
+        }
+        // Zeroes `master_key_hex` itself before returning, on success and on every failure.
+        if (pc_setup_sign_with_master(setup, master_key_hex) != 0) {
+            report(setup, "could not sign the approval");
+            return 1;
+        }
     }
 
-    if (!signature_hex.empty()) {
-        // Step 1 then submitting the caller-provided signature (pc_agent_approve_with_signature)
-        // would run here. Still no master key touches this process.
-        std::fprintf(stdout,
-                     "--signature: would submit the provided signature (%zu hex chars) "
-                     "via approveAgent.\n",
-                     signature_hex.size());
-        report_missing_abi();
-        return 3;
-    }
+    char master_address[PC_ADDR_STR_CAP]{};
+    pc_setup_master_address(setup, master_address, sizeof(master_address));
+    std::fprintf(stdout, "\nApproval signed by %s. Submitting...\n", master_address);
+    std::fflush(stdout);
 
-    // Interactive path (docs/06 §2 steps 1-5): the master key lives in this process for the
-    // duration of one signature. It is read into a fixed stack buffer (never a CLI argument,
-    // which would land in shell history and `ps`), never logged, and zeroed via secure_zero()
-    // the moment it is no longer needed -- which today is immediately, since there is no ABI
-    // call yet to actually sign with it.
-    char master_key_hex[128]{};
-    const bool got_master =
-        read_secret_line("Master private key (hex, used once, never stored): ", master_key_hex,
-                         sizeof(master_key_hex));
-    secure_zero(master_key_hex, sizeof(master_key_hex));
-    if (!got_master) {
-        std::fputs("parsec setup: failed to read master private key\n", stderr);
+    if (pc_setup_submit(setup) != 0) {
+        report(setup, "approveAgent was rejected");
+        std::fputs(
+            "\nNothing was stored. Common causes: the account has never deposited on this\n"
+            "network, or the master key signed for the other network (mainnet vs testnet).\n",
+            stderr);
         return 1;
     }
+    std::fputs("Agent approved.\n", stdout);
 
-    // Step 6: keystore passphrase, twice, must match, never echoed, never logged.
-    char pass1[256]{};
-    char pass2[256]{};
-    const bool ok1 = read_secret_line("Keystore passphrase: ", pass1, sizeof(pass1));
-    const bool ok2 = ok1 && read_secret_line("Confirm keystore passphrase: ", pass2, sizeof(pass2));
-    const bool match = ok1 && ok2 && std::strcmp(pass1, pass2) == 0;
-    secure_zero(pass1, sizeof(pass1));
-    secure_zero(pass2, sizeof(pass2));
-    if (!match) {
-        std::fputs("parsec setup: passphrases did not match (or could not be read)\n", stderr);
-        return 1;
-    }
-
-    std::fputs(
-        "\nMaster key and passphrase collected and handled correctly (never logged, "
-        "zeroed after use).\n",
-        stdout);
-    report_missing_abi();
-    return 3;
+    return seal_and_write(setup, keystore_path);
 }
 
 }  // namespace pc::app::cli

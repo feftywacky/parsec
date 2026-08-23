@@ -167,7 +167,7 @@ tests/rust/signing_vectors.rs
 - **Query with the master address, sign with the agent key.** Wire the two addresses into
   distinct types (`MasterAddress`, `AgentAddress`) so they cannot be swapped by accident —
   the failure mode is an empty account, which looks like "no positions" rather than an error.
-- `parsec setup` and `parsec setup --print-approval` per 06 §2, plus the `--signature` path.
+- `parsec setup` per 06 §2, and the same flow in-app as the first-run connect dialog.
 
 **Acceptance**
 - Signing unit tests pass offline against Python-SDK vectors.

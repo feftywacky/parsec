@@ -124,7 +124,10 @@ void draw_status_bar(PanelContext& ctx) {
                            safety.rate_budget_bps / 100, safety.rate_budget_bps % 100);
     }
 
-    if (!safety.dms_active) {
+    if (safety.dms_unavailable) {
+        ImGui::TextColored(kColorWarning,
+                           "Dead man's switch: unavailable until $1M account volume");
+    } else if (!safety.dms_active) {
         ImGui::TextColored(kColorTextMuted,
                            "Dead man's switch: inactive (no authenticated session)");
     } else {

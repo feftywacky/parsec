@@ -37,6 +37,7 @@ static_assert(sizeof(pc_trade) == 40);
 static_assert(sizeof(pc_candle) == 64);
 static_assert(sizeof(pc_asset_ctx) == 56);
 static_assert(sizeof(pc_asset_data) == 48);
+static_assert(sizeof(pc_fee_rates) == 16);
 static_assert(sizeof(pc_order_update) == 64);
 static_assert(sizeof(pc_fill) == 72);
 static_assert(sizeof(pc_position) == 72);

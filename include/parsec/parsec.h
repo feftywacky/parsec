@@ -38,7 +38,7 @@ enum {
 enum {
     PC_EV_L2_BOOK = 1, PC_EV_BBO, PC_EV_TRADE, PC_EV_CANDLE, PC_EV_ASSET_CTX,
     PC_EV_ASSET_DATA, PC_EV_ORDER_UPDATE, PC_EV_FILL, PC_EV_POSITION, PC_EV_ACCOUNT,
-    PC_EV_ORDER_ACK, PC_EV_CONN, PC_EV_RATE, PC_EV_ERROR, PC_EV_FUNDING,
+    PC_EV_ORDER_ACK, PC_EV_CONN, PC_EV_RATE, PC_EV_ERROR, PC_EV_FUNDING, PC_EV_FEE_RATES,
 };
 enum {
     PC_F_SNAPSHOT = 1u << 0, PC_F_SNAPSHOT_BEGIN = 1u << 1,
@@ -88,6 +88,7 @@ enum {
     PC_FETCH_META = 1, PC_FETCH_CLEARINGHOUSE_STATE, PC_FETCH_OPEN_ORDERS,
     PC_FETCH_USER_FILLS, PC_FETCH_USER_FUNDING, PC_FETCH_HISTORICAL_ORDERS,
     PC_FETCH_CANDLE_SNAPSHOT, PC_FETCH_ACTIVE_ASSET_DATA, PC_FETCH_USER_RATE_LIMIT,
+    PC_FETCH_USER_FEES,
 };
 
 typedef struct { pc_px px; pc_qty sz; uint32_t n; uint32_t _pad; } pc_level;
@@ -102,7 +103,13 @@ typedef struct { pc_level bid, ask; bool has_bid, has_ask; } pc_bbo;
 typedef struct { pc_px px; pc_qty sz; uint64_t tid; uint64_t time_ms; uint8_t is_buy; } pc_trade;
 typedef struct { uint64_t open_ms, close_ms; pc_px o,h,l,c; pc_qty v; uint32_t n; uint8_t interval; } pc_candle;
 typedef struct { pc_px mark,oracle,mid,prev_day; pc_usd day_ntl_vlm,open_interest; int64_t funding_1e8; } pc_asset_ctx;
+/* `max_trade_*` are base-asset quantities; `avail_*` mirror `availableToTrade` and are
+   side-specific USDC notional budgets. */
 typedef struct { pc_qty max_trade_buy,max_trade_sell; pc_usd avail_buy,avail_sell; pc_px mark; uint32_t leverage; uint8_t is_cross; } pc_asset_data;
+/* Effective account fee rates from `userFees`. Both values are fractions on the shared
+   1e8 grid: 0.00045 (0.045%) is 45000. `maker_rate` may be negative when the account
+   receives a maker rebate. */
+typedef struct { int64_t maker_rate, taker_rate; } pc_fee_rates;
 typedef struct { uint64_t oid; uint8_t cloid[16]; uint16_t status; pc_px px; pc_qty sz,orig_sz; uint8_t is_buy,reduce_only; } pc_order_update;
 typedef struct { uint64_t oid,tid; uint8_t cloid[16]; pc_px px; pc_qty qty; pc_usd fee,closed_pnl; uint8_t is_buy,is_taker; } pc_fill;
 typedef struct { pc_qty szi; pc_px entry_px,liq_px; pc_usd position_value,unrealized_pnl,margin_used,cum_funding; int32_t roe_bps; uint32_t leverage; uint8_t is_cross; } pc_position;
@@ -127,7 +134,7 @@ typedef struct {
     uint64_t exch_time_ms, recv_time_ns;
     union {
         pc_l2 l2; pc_bbo bbo; pc_trade trade; pc_candle candle; pc_asset_ctx asset_ctx;
-        pc_asset_data asset_data; pc_order_update order_update; pc_fill fill;
+        pc_asset_data asset_data; pc_fee_rates fee_rates; pc_order_update order_update; pc_fill fill;
         pc_position position; pc_account account; pc_order_ack ack; pc_conn conn;
         pc_rate rate; pc_error error; pc_funding funding;
     } u;
@@ -173,6 +180,99 @@ pc_req_id pc_fetch(pc_engine*, uint32_t what, const char* coin);
    explicitly. `pc_fetch` remains available for the other fetch kinds and defaults candle
    snapshots to 1m for ABI compatibility. */
 pc_req_id pc_fetch_candle_snapshot(pc_engine*, const char* coin, uint8_t interval);
+/* ---------------------------------------------------------------------------------
+   Account connection: agent-wallet onboarding and interactive unlock (docs/06 §2).
+
+   parsec never stores your MetaMask master key. It stores an *agent wallet* key: a
+   separate keypair your master key approves once, which can trade the account but
+   cannot withdraw from it (docs/06 §1). So "connecting an account" is two things —
+   a one-time `parsec setup` that approves an agent and writes an encrypted keystore,
+   and a per-session unlock of that keystore with a passphrase.
+   --------------------------------------------------------------------------------- */
+
+/* --- one-time onboarding, `parsec setup`. Engine-free: no pc_engine exists yet. --- */
+
+typedef struct pc_setup pc_setup;
+
+#define PC_ADDR_STR_CAP 43  /* "0x" + 40 hex + NUL */
+
+/* Generate a fresh agent keypair and fix this approval's parameters. The private key
+   lives inside the returned handle and never crosses this boundary — there is no call
+   to retrieve it, by design (docs/06 §5 rule 1).
+
+   `agent_name` may be NULL for the default `parsec-<host>-<id>`; the ` valid_until <ms>`
+   suffix the venue enforces is appended automatically. `lifetime_ms` may be 0 for the
+   180-day default, and is clamped to that maximum. Always a NEW keypair: an agent
+   address is never reused, because the venue may prune a deregistered agent's nonce
+   state and make old signed actions replayable (docs/06 §1). */
+pc_setup* pc_setup_begin(bool mainnet, const char* agent_name, uint64_t lifetime_ms);
+void pc_setup_free(pc_setup*);
+int32_t pc_setup_last_error(pc_setup*, char* out, uint32_t cap);
+
+int32_t pc_setup_agent_address(pc_setup*, char* out, uint32_t cap);
+int32_t pc_setup_agent_name(pc_setup*, char* out, uint32_t cap);
+/* Known only after one of the two approval paths below: it is *recovered from the
+   signature*, never supplied by the caller. Returns -1 before then. */
+int32_t pc_setup_master_address(pc_setup*, char* out, uint32_t cap);
+uint64_t pc_setup_valid_until_ms(pc_setup*);
+
+/* Approve the agent: the master key exists here for the duration of one signature (docs/06
+   §2 steps 2-5). `master_sk_hex` is a WRITABLE buffer holding the key as hex; it is zeroed
+   before this function returns on every path, including every error path. The master address
+   is then recovered from the signature, never derived from the key. */
+int32_t pc_setup_sign_with_master(pc_setup*, char* master_sk_hex);
+
+/* POST the approval to /exchange. BLOCKS. Returns 0 only on {"status":"ok"}. */
+int32_t pc_setup_submit(pc_setup*);
+
+/* Seal the agent key and write ~/.parsec/keystore-<network>.json, mode 0600 (parent
+   dir 0700). Refuses unless pc_setup_submit succeeded, and refuses to overwrite an
+   existing keystore. BLOCKS for ~3.5s in Argon2id — never call it on a UI thread. */
+int32_t pc_setup_write_keystore(pc_setup*, const char* passphrase, const char* path);
+
+/* --- per-session unlock --- */
+
+/* pc_auth_status values. PC_AUTH_NO_KEYSTORE means no keystore is configured at all —
+   surface that as "connect an account", not as a passphrase prompt. PC_AUTH_EXPIRED means
+   one exists but its agent approval has lapsed; no passphrase can open it, so surface a
+   re-approval, not a prompt. Both are reported from the keystore's cleartext header,
+   before anything is typed. */
+enum {
+    PC_AUTH_NO_KEYSTORE = 0, PC_AUTH_LOCKED, PC_AUTH_UNLOCKING,
+    PC_AUTH_UNLOCKED, PC_AUTH_FAILED, PC_AUTH_EXPIRED,
+};
+int32_t pc_auth_status(pc_engine*);
+
+/* Start an unlock attempt. Returns immediately — Argon2id runs on a blocking task, so
+   poll pc_auth_status for the outcome (the reason for a failure also arrives as a
+   PC_EV_ERROR event). `passphrase` is a WRITABLE buffer and is zeroed before return. */
+int32_t pc_unlock(pc_engine*, char* passphrase);
+
+/* Point the engine at a keystore created after startup (the in-app connect flow). Refused
+   once unlocked. Returns 0 on success. */
+int32_t pc_set_keystore_path(pc_engine*, const char* path);
+
+/* Delete every local keystore (both networks) and return the engine to its fresh-install
+   state, so the UI shows "connect an account" next. Returns the number of files removed,
+   or -1 if refused (already unlocked/unlocking) or a delete failed — see pc_last_error.
+   LOCAL ONLY: the agent approval still stands at the venue until it lapses; revoking it
+   needs the master key parsec never stores. The deleted key was fundless regardless. */
+int32_t pc_reset_accounts(pc_engine*);
+
+/* The unlocked account's addresses and agent expiry. -1 until unlocked. The two
+   addresses are not interchangeable: `master` holds the funds and is what every /info
+   query uses, `agent` is the fundless key that signs (docs/06 §1). */
+int32_t pc_auth_addresses(pc_engine*, char* master_out, uint32_t master_cap,
+                          char* agent_out, uint32_t agent_cap, uint64_t* valid_until_ms);
+
+/* Read a keystore's cleartext header without a passphrase, so an unlock prompt can name
+   the account and warn about a near-expiry agent before anything is typed. Every field
+   here is already cleartext in the file and AAD-bound, so it cannot be altered without
+   making the keystore undecryptable. */
+int32_t pc_keystore_peek(const char* path, char* master_out, uint32_t master_cap,
+                         char* agent_out, uint32_t agent_cap, uint64_t* valid_until_ms,
+                         bool* is_mainnet);
+
 int32_t pc_asset_count(pc_engine*);
 int32_t pc_asset_info(pc_engine*, uint32_t asset, char* name_out, uint32_t cap,
                       uint8_t* sz_decimals, uint32_t* max_leverage, uint8_t* only_isolated);

@@ -56,15 +56,5 @@ struct Config {
     [[nodiscard]] bool save(const std::string& path) const noexcept;
 };
 
-// Mainnet session gate (docs/06 §5.7 rule 7, docs/07 Phase 7 #5): authenticated mainnet use
-// still requires two independent signals -- the resolved network flag and a typed confirmation.
-// Public market data can open by default without a keystore or confirmation.
-struct MainnetGate {
-    // The exact string the user must type. Case-sensitive and exact-match on purpose: accepting
-    // "mainnet" or a prefix would make the second signal a formality instead of a deliberate act.
-    static constexpr const char* kRequiredConfirmation = "MAINNET";
-
-    [[nodiscard]] static bool allowed(const Config& cfg, const char* typed_confirmation) noexcept;
-};
 
 }  // namespace pc::app

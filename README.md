@@ -5,18 +5,20 @@ A fast, minimal native trading terminal for Hyperliquid perpetuals.
 C++20 trading core, Rust network/signing edge, Dear ImGui interface. One binary, no browser,
 no runtime.
 
-> **Status: foundation implemented; public market data only.** The application opens a native
-> GLFW window and streams public market data through the Rust/C++ ABI. Authenticated order
-> actions remain deliberately disabled until the agent-wallet flow and safety gates are complete.
+> **Status: market data live; account connection implemented, trading unverified on a funded
+> account.** The application opens a native GLFW window and streams public market data through
+> the Rust/C++ ABI. `parsec setup` approves an agent wallet and writes an encrypted keystore,
+> and the terminal unlocks it interactively at startup; signing and order submission are wired
+> end to end. What has not been exercised is a full round trip on a funded account — see
+> `docs/08-testing.md`.
 
 ## Build and run
 
 ```sh
 cmake -S . -B build
 cmake --build build
-./build/parsec
-# Use testnet explicitly when needed:
-./build/parsec --testnet
+./build/parsec              # mainnet by default
+./build/parsec --testnet    # testnet
 ```
 
 Run the checks with `cargo test` from `rust/` and `ctest --test-dir build`.
@@ -50,3 +52,35 @@ pass `--testnet` to use testnet. Select the active coin from the in-app coin pic
 
 Trading keys are **agent wallets** — they can trade but cannot withdraw. The master key is
 used once, to approve the agent, and is never stored. See [`docs/06-security.md`](docs/06-security.md).
+
+## Signing in
+
+Just run it:
+
+```sh
+./build/parsec              # mainnet
+./build/parsec --testnet    # testnet
+```
+
+On first launch parsec offers to **connect an account**. You give it your MetaMask private
+key and choose a keystore passphrase. It generates a fresh agent wallet, uses your key for
+exactly one signature to approve that agent, zeroes the key, and writes
+`~/.parsec/keystore-<network>.json` (mode 0600) holding only the agent key, encrypted.
+
+Your MetaMask key is never stored, never logged, and never passed as an argument. It exists
+in the process for the duration of one signature. Hyperliquid has no usernames or passwords —
+an account *is* a keypair — so that one signature is the only way to prove the account is
+yours and authorise the agent to trade for it.
+
+Connecting a mainnet account asks you to type `MAINNET` before it will use your key — the
+second independent signal required by [`docs/06-security.md`](docs/06-security.md) §5.7.
+Every later launch just asks for the keystore passphrase; the network is fixed by the flag
+you launched with, and the dialog header and status bar name it throughout.
+
+Market data streams whether or not you sign in; trading, positions, and PnL need the unlock.
+Unlocking takes ~3.5 s of Argon2id on purpose, and runs off the render thread.
+
+The same flow is available headless as `parsec setup [--testnet]`, but you do not need it.
+
+**To revoke**, approve a new agent with the same name — from MetaMask on a phone if that is
+faster than getting to a laptop. The old agent key stops working immediately.

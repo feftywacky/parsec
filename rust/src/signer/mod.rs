@@ -32,7 +32,7 @@ pub(crate) fn word(value: &[u8]) -> [u8; 32] {
 /// Ethereum address (last 20 bytes of `keccak256(uncompressed_pubkey[1..])`) for a
 /// secp256k1 verifying key. Shared by agent-address derivation (`agent::derive_address`)
 /// and signature recovery (`recover_address`) so both paths agree by construction.
-pub(crate) fn address_from_verifying_key(vk: &VerifyingKey) -> [u8; 20] {
+pub fn address_from_verifying_key(vk: &VerifyingKey) -> [u8; 20] {
     let point = vk.to_encoded_point(false);
     let hash = keccak(&point.as_bytes()[1..]);
     let mut out = [0u8; 20];

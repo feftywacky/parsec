@@ -26,6 +26,13 @@ constexpr uint64_t kPollTimeoutNs = 500'000;  // 0.5 ms
 // either way, every PC_EV_POSITION snapshot batch gets reconciled (see reconcile_positions()),
 // this just guarantees one happens at least this often even if the WS side goes quiet.
 constexpr uint64_t kReconcileIntervalMs = 4'000;
+constexpr uint64_t kFeeRatesRefreshIntervalMs = 60'000;
+// activeAssetData is pulled from three places (asset switch, reconciler tick, and every
+// account snapshot). The reconciler's clearinghouseState fetch comes back as a PC_EV_ACCOUNT
+// a few ms later, so without a floor each 4 s tick issued the same /info POST twice. Matching
+// the reconciler cadence keeps the account-event path from adding anything the tick will not
+// already have refreshed.
+constexpr uint64_t kAssetDataRefreshIntervalMs = kReconcileIntervalMs;
 
 // Divergence tolerance for the position reconciler, in Qty (1e8-scaled) units. Dust-level
 // drift between an optimistic fill-projection and the next venue snapshot (e.g. from a
@@ -61,6 +68,10 @@ bool Engine::start() {
     active_asset_.store(PC_ASSET_NONE, std::memory_order_relaxed);
     universe_published_ = false;
     subscribed_intervals_ = 0;
+    dms_deadline_ms_ = 0;
+    dms_active_ = false;
+    dms_unavailable_ = false;
+    dms_req_id_ = 0;
 
     pc_config cfg{};
     cfg.abi_version = PC_ABI_VERSION;
@@ -68,12 +79,11 @@ bool Engine::start() {
     cfg.event_queue_capacity = 8192;
     cfg.io_worker_threads = 2;
     // No passphrase here by design: Config never carries the keystore passphrase (it is a
-    // secret, config.json is not), so a config with no interactive unlock step starts
-    // unauthenticated -- read-only market data, no account/order events, which is exactly the
-    // "missing config/keystore must never block startup" requirement. Wiring an interactive
-    // unlock (src/ui/dialog_unlock.hpp's Verifier) through to a second, later pc_engine_create
-    // or a dedicated unlock FFI call is future work; there is currently no ABI entry point for
-    // "unlock after construction" (see this pass's report).
+    // secret, config.json is not). The engine therefore always starts unauthenticated --
+    // read-only market data, no account/order events -- and the passphrase arrives later
+    // through Engine::unlock()/pc_unlock from the UI's unlock dialog. That ordering is not
+    // just a convenience: Argon2id at the SENSITIVE tier costs ~3.5s (docs/06 §3), so doing
+    // it during construction would stall startup before a window ever appeared.
     //
     // Only pass the path down if a keystore actually exists there: config_.keystore_path always
     // has a value (defaults() sets it), even on a fresh install with no keystore, and handing
@@ -159,6 +169,8 @@ void Engine::publish_asset_universe() noexcept {
         auto& option = snapshot.assets[snapshot.count++];
         option.asset = static_cast<uint32_t>(i);
         option.sz_decimals = sz_decimals;
+        option.max_leverage = max_leverage;
+        option.only_isolated = only_isolated;
         std::snprintf(option.name, sizeof(option.name), "%s", name);
     }
     bridge_.publish_universe(snapshot);
@@ -190,12 +202,21 @@ void Engine::select_asset(uint32_t asset, uint8_t interval) noexcept {
         std::snprintf(active_coin_, sizeof(active_coin_), "%s", name);
         subscribed_intervals_ = 0;
         active_asset_.store(asset, std::memory_order_relaxed);
+        asset_data_asset_ = PC_ASSET_NONE;
+        asset_data_valid_ = false;
         bridge_.publish_instrument(InstrumentSnapshot{});
         // Carries the granularity currently selected in the book panel, so switching coins
         // does not silently reset the ladder to the venue's native step.
         pc_subscribe_book(ffi_, active_coin_, kMarketStreams, book_n_sig_figs_, book_mantissa_);
     }
 
+    // Unthrottled on purpose: a just-selected coin has no activeAssetData at all, so this
+    // must not wait on the refresh floor. Stamping it keeps the next account snapshot from
+    // immediately duplicating the request.
+    if (account_valid_ && active_coin_[0] != '\0') {
+        pc_fetch(ffi_, PC_FETCH_ACTIVE_ASSET_DATA, active_coin_);
+        last_asset_data_fetch_ms_ = unix_ms();
+    }
     subscribe_interval(asset, interval);
 }
 
@@ -226,6 +247,26 @@ void Engine::apply_event(const pc_event& event) noexcept {
             account_valid_ = true;
             // Re-bases both AccountState's authoritative and optimistic views (docs/02 §6.4).
             account_state_.apply_authoritative(event.u.account);
+            if (active_coin_[0] != '\0' &&
+                unix_ms() - last_asset_data_fetch_ms_ >= kAssetDataRefreshIntervalMs) {
+                pc_fetch(ffi_, PC_FETCH_ACTIVE_ASSET_DATA, active_coin_);
+                last_asset_data_fetch_ms_ = unix_ms();
+            }
+            if (unix_ms() - last_fee_rates_fetch_ms_ >= kFeeRatesRefreshIntervalMs) {
+                pc_fetch(ffi_, PC_FETCH_USER_FEES, nullptr);
+                last_fee_rates_fetch_ms_ = unix_ms();
+            }
+            break;
+
+        case PC_EV_ASSET_DATA:
+            asset_data_ = event.u.asset_data;
+            asset_data_asset_ = event.asset;
+            asset_data_valid_ = event.asset != PC_ASSET_NONE;
+            break;
+
+        case PC_EV_FEE_RATES:
+            fee_rates_ = event.u.fee_rates;
+            fee_rates_valid_ = true;
             break;
 
         case PC_EV_ORDER_ACK: {
@@ -297,8 +338,11 @@ void Engine::apply_event(const pc_event& event) noexcept {
             // A pong-carried heartbeat only updates the latency readout. Pushing it as a UI
             // event would put a "connected" line in the event log every 5 seconds and bury
             // the state transitions the log exists to record.
-            if (event.u.conn.rtt_us != 0 && event.u.conn.socket == PC_SOCK_MARKET) {
-                market_rtt_us_ = event.u.conn.rtt_us;
+            if (event.u.conn.rtt_us != 0) {
+                if (event.u.conn.socket == PC_SOCK_MARKET)
+                    market_rtt_us_ = event.u.conn.rtt_us;
+                else
+                    user_rtt_us_ = event.u.conn.rtt_us;
                 if (event.u.conn.state == PC_CONN_CONNECTED)
                     break;
             }
@@ -313,6 +357,15 @@ void Engine::apply_event(const pc_event& event) noexcept {
 
         case PC_EV_ERROR:
             if (event.u.error.code < 0) {
+                if (event.req_id != 0 && event.req_id == dms_req_id_ &&
+                    std::strstr(event.u.error.msg, "enough volume traded") != nullptr) {
+                    // Hyperliquid permanently rejects scheduleCancel for low-volume accounts.
+                    // Stop the automatic heartbeat until the next process/session start rather
+                    // than spending another signed request and repeating the same warning.
+                    dms_unavailable_ = true;
+                    dms_active_ = false;
+                    dms_deadline_ms_ = 0;
+                }
                 PC_LOG_WARN("parsec: %s", event.u.error.msg);
                 bridge_.push_event(make_toast(event.u.error.msg, 2, event.recv_time_ns));
             }
@@ -329,6 +382,13 @@ void Engine::apply_event(const pc_event& event) noexcept {
 void Engine::drain_ui_commands() noexcept {
     UiCommand cmd{};
     while (bridge_.try_pop_command(cmd)) {
+        // How long this command sat in the ring. Measured before it is acted on, so an order's
+        // own submission cost is not folded into the handoff figure the status bar reports.
+        if (cmd.enqueue_mono_ns != 0) {
+            const uint64_t now_ns = monotonic_ns();
+            if (now_ns > cmd.enqueue_mono_ns)
+                engine_cmd_us_ = ewma_us(engine_cmd_us_, (now_ns - cmd.enqueue_mono_ns) / 1000);
+        }
         switch (cmd.kind) {
             case UiCommandKind::PlaceOrder: {
                 // The safety-net gate (docs/02 §6.5, docs/07 Phase 5): an armed kill switch or
@@ -494,7 +554,15 @@ void Engine::publish(uint64_t now_ms) noexcept {
     if (asset != PC_ASSET_NONE)
         markets_.snapshot(asset, now_ms, staleness_cfg_, instrument);
     bridge_.publish_instrument(instrument);
-    bridge_.publish_portfolio(make_portfolio_snapshot(account_, account_valid_, positions_));
+    auto portfolio = make_portfolio_snapshot(account_, account_valid_, positions_);
+    if (asset_data_valid_ && asset_data_asset_ == asset) {
+        portfolio.asset_data = asset_data_;
+        portfolio.asset_data_asset = asset_data_asset_;
+        portfolio.asset_data_valid = true;
+    }
+    portfolio.fee_rates = fee_rates_;
+    portfolio.fee_rates_valid = fee_rates_valid_;
+    bridge_.publish_portfolio(portfolio);
 }
 
 // docs/02 §4.2's tick_timers step: dead man's switch, reconciliation cadence, order timeouts
@@ -511,9 +579,19 @@ void Engine::tick_timers(uint64_t now_ms) noexcept {
     // every ~0.5ms regardless.
     SafetySnapshot safety{};
     safety.dms_active = dms_active_;
+    safety.dms_unavailable = dms_unavailable_;
     safety.dms_deadline_ms = dms_deadline_ms_;
     safety.dms_triggers_remaining_today = dms_.triggers_remaining_today(now_ms);
     safety.market_rtt_us = market_rtt_us_;
+    safety.user_rtt_us = user_rtt_us_;
+    safety.engine_tick_us = engine_tick_us_;
+    safety.engine_tick_max_us = engine_tick_max_us_;
+    safety.engine_batch_events = engine_batch_events_;
+    safety.engine_cmd_us = engine_cmd_us_;
+    safety.publish_mono_ns = monotonic_ns();
+    // Per-window worst case: the UI reads "the slowest tick since you last looked", not an
+    // all-time high that never decays once one scheduler hiccup has set it.
+    engine_tick_max_us_ = 0;
     safety.rate_budget_bps = rate_budget_.remaining_bps();
     safety.rate_budget_remaining = rate_budget_.remaining();
     safety.kill_switch_armed = kill_switch_.blocks_new_orders();
@@ -530,12 +608,12 @@ void Engine::tick_timers(uint64_t now_ms) noexcept {
 // with no keystore therefore never sends scheduleCancel, which is correct -- there is nothing
 // resting on the venue for it to protect.
 void Engine::tick_dead_mans_switch(uint64_t now_ms) noexcept {
-    if (!account_valid_)
+    if (!account_valid_ || dms_unavailable_)
         return;
     if (!dms_.needs_refresh(now_ms))
         return;
     const uint64_t deadline = dms_.refresh(now_ms);
-    pc_schedule_cancel(ffi_, deadline);
+    dms_req_id_ = pc_schedule_cancel(ffi_, deadline);
     dms_deadline_ms_ = deadline;
     dms_active_ = true;
 }
@@ -556,6 +634,14 @@ void Engine::tick_reconciler(uint64_t now_ms) noexcept {
     last_reconcile_fetch_ms_ = now_ms;
     pc_fetch(ffi_, PC_FETCH_CLEARINGHOUSE_STATE, nullptr);
     pc_fetch(ffi_, PC_FETCH_OPEN_ORDERS, nullptr);
+    if (active_coin_[0] != '\0') {
+        pc_fetch(ffi_, PC_FETCH_ACTIVE_ASSET_DATA, active_coin_);
+        last_asset_data_fetch_ms_ = now_ms;
+    }
+    if (now_ms - last_fee_rates_fetch_ms_ >= kFeeRatesRefreshIntervalMs) {
+        pc_fetch(ffi_, PC_FETCH_USER_FEES, nullptr);
+        last_fee_rates_fetch_ms_ = now_ms;
+    }
 }
 
 // Compares the fill-nudged optimistic projection against the venue snapshot that just landed
@@ -603,16 +689,33 @@ void Engine::run() {
     while (running_.load(std::memory_order_relaxed)) {
         const int32_t n = pc_poll(ffi_, poll_buffer_.data(),
                                   static_cast<uint32_t>(poll_buffer_.size()), kPollTimeoutNs);
+
+        // Timed from *after* pc_poll returns: the poll wait is a blocking sleep on an idle
+        // socket, not work, and including it would report a quiet market as the slowest loop.
+        const uint64_t work_start_ns = monotonic_ns();
         for (int32_t i = 0; i < n; ++i)
             apply_event(poll_buffer_[static_cast<size_t>(i)]);
 
         const uint64_t now = unix_ms();
         resolve_active_asset();
         drain_ui_commands();
+        // tick_timers publishes the SafetySnapshot, so it reads the previous iteration's
+        // figures -- one loop of lag on a number that is itself an EWMA, which is fine and
+        // avoids either measuring the publish inside itself or publishing twice per loop.
         tick_timers(now);
         orders_.expire(now);
         if (n > 0)
             publish(now);
+
+        const uint64_t work_end_ns = monotonic_ns();
+        const uint64_t work_us =
+            work_end_ns > work_start_ns ? (work_end_ns - work_start_ns) / 1000 : 0;
+        engine_tick_us_ = ewma_us(engine_tick_us_, work_us);
+        if (work_us > engine_tick_max_us_)
+            engine_tick_max_us_ = work_us > 0xFFFF'FFFFULL ? 0xFFFF'FFFFU
+                                                           : static_cast<uint32_t>(work_us);
+        if (n > 0)
+            engine_batch_events_ = static_cast<uint32_t>(n);
     }
 }
 

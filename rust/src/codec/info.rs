@@ -382,6 +382,17 @@ pub struct ActiveAssetData {
     pub mark_px: String,
 }
 
+// `userFees` contains a large schedule and daily-volume history. The UI only needs the
+// account's effective perp rates, so keep this edge model intentionally narrow. The rates
+// are decimal strings on the wire and are converted to the shared 1e8 fixed-point grid by
+// `ffi::fetch`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserFees {
+    pub user_cross_rate: String,
+    pub user_add_rate: String,
+}
+
 // ---------------------------------------------------------------------------------
 // userRateLimit
 // ---------------------------------------------------------------------------------
@@ -582,6 +593,15 @@ mod tests {
         .unwrap();
         assert_eq!(data.coin, "APT");
         assert_eq!(data.max_trade_szs[0], "24836370.44");
+    }
+
+    #[test]
+    fn user_fees_matches_effective_rate_fields() {
+        let fees: UserFees =
+            serde_json::from_str(r#"{"userCrossRate":"0.00045","userAddRate":"-0.00015"}"#)
+                .unwrap();
+        assert_eq!(fees.user_cross_rate, "0.00045");
+        assert_eq!(fees.user_add_rate, "-0.00015");
     }
 
     #[test]

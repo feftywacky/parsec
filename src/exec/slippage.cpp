@@ -23,4 +23,32 @@ SlippageEstimate SlippageModel::estimate(const md::L2Book& book, Side side, Qty 
     return est;
 }
 
+LimitFillEstimate SlippageModel::estimate_limit(const md::L2Book& book, Side side, Qty requested,
+                                                Px limit_px, Px reference) noexcept {
+    LimitFillEstimate est{};
+    if (requested <= 0 || limit_px <= 0)
+        return est;
+
+    // depth_within() counts exactly the levels a limit at `limit_px` is allowed to take, so
+    // sweeping that much can never walk past the limit price -- the sweep consumes levels from
+    // the touch outwards and stops once it has taken `immediate`.
+    const Qty crossable = book.depth_within(limit_px, side);
+    const Qty immediate = crossable < requested ? crossable : requested;
+    est.resting = requested - (immediate > 0 ? immediate : 0);
+    if (immediate <= 0)
+        return est;
+
+    const auto sweep = book.sweep(side, immediate);
+    est.avg_px = sweep.avg_px;
+    est.immediate = sweep.filled;
+    est.resting = requested - sweep.filled;
+    est.notional = sweep.notional;
+    if (sweep.filled > 0 && reference > 0) {
+        const __int128 diff = side == Side::Buy ? static_cast<__int128>(sweep.avg_px) - reference
+                                                : static_cast<__int128>(reference) - sweep.avg_px;
+        est.slippage_bps = static_cast<int32_t>(diff * 10'000 / reference);
+    }
+    return est;
+}
+
 }  // namespace pc::exec

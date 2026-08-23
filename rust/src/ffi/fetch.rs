@@ -57,7 +57,8 @@ pub async fn dispatch(
         | PC_FETCH_USER_FUNDING
         | PC_FETCH_HISTORICAL_ORDERS
         | PC_FETCH_ACTIVE_ASSET_DATA
-        | PC_FETCH_USER_RATE_LIMIT => match session {
+        | PC_FETCH_USER_RATE_LIMIT
+        | PC_FETCH_USER_FEES => match session {
             None => Err(
                 "this fetch needs the account's master address, which is only known \
                  once an agent keystore is unlocked"
@@ -88,6 +89,7 @@ pub async fn dispatch(
                     PC_FETCH_USER_RATE_LIMIT => {
                         fetch_user_rate_limit(&http, &events, &session, &master, req_id).await
                     }
+                    PC_FETCH_USER_FEES => fetch_user_fees(&http, &events, &master, req_id).await,
                     _ => unreachable!("matched by the outer arm"),
                 }
             }
@@ -241,7 +243,7 @@ fn candle_interval_id(interval: &str) -> Option<u8> {
 // account-scoped fetches — queried with the MASTER address (docs/03 §5)
 // ---------------------------------------------------------------------------------
 
-async fn fetch_clearinghouse_state(
+pub(crate) async fn fetch_clearinghouse_state(
     http: &HttpClient,
     events: &EventQueue,
     registry: &SharedRegistry,
@@ -600,6 +602,31 @@ async fn fetch_active_asset_data(
             mark: parse_scaled(&data.mark_px).unwrap_or(0),
             leverage: data.leverage.value,
             is_cross: (data.leverage.kind == "cross") as u8,
+        },
+    };
+    events.push(event);
+    Ok(())
+}
+
+async fn fetch_user_fees(
+    http: &HttpClient,
+    events: &EventQueue,
+    master: &str,
+    req_id: u64,
+) -> Result<(), String> {
+    let body = json!({"type": "userFees", "user": master});
+    let value = http
+        .post_info_with_retry(&body, |ms| events.push(rate_event(ms, req_id)))
+        .await
+        .map_err(|e| format!("userFees fetch failed: {e}"))?;
+    let fees: info::UserFees =
+        serde_json::from_value(value).map_err(|e| format!("userFees decode failed: {e}"))?;
+    let mut event = base_event(PC_EV_FEE_RATES, PC_ASSET_NONE, 0, req_id);
+    event.u = PcEventUnion {
+        fee_rates: PcFeeRates {
+            // `userAddRate` is the effective maker/add rate and may be negative for a rebate.
+            maker_rate: parse_scaled(&fees.user_add_rate).unwrap_or(0),
+            taker_rate: parse_scaled(&fees.user_cross_rate).unwrap_or(0),
         },
     };
     events.push(event);

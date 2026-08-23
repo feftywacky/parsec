@@ -476,6 +476,19 @@ a leverage instead of a USD amount:
   "nonce":1716531066415},
  "nonce":1716531066415,"signature":{}}
 ```
+**`agentName` is capped at 16 characters** — VERIFIED against live mainnet, and documented
+nowhere in the API reference. An over-long name is rejected after the signature validates,
+with:
+
+```
+Extra agent name must be between 1 and 16 characters long.
+```
+
+The cap applies to the **base name only**; the ` valid_until <ms>` suffix is parsed off by the
+venue and does not count against it. This is why parsec's default agent name is
+`parsec-<8 hex>` (15 chars) rather than anything host-derived — see `ffi::setup`'s
+`MAX_AGENT_NAME_LEN`.
+
 Python SDK detail worth copying exactly: `agentName` is included in the **signed** payload as
 `""` when no name is given, then **deleted from the action before POSTing**:
 ```python

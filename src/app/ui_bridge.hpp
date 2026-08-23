@@ -15,6 +15,7 @@
 
 #include "core/seqlock.hpp"
 #include "core/spsc_ring.hpp"
+#include "core/time.hpp"
 #include "md/asset_ctx.hpp"
 #include "md/market_store.hpp"
 #include "parsec/parsec.h"
@@ -40,6 +41,8 @@ struct AssetOption {
     uint32_t asset{PC_ASSET_NONE};
     char name[PC_COIN_LEN]{};
     uint8_t sz_decimals{};
+    uint32_t max_leverage{};
+    uint8_t only_isolated{};
 };
 static_assert(std::is_trivially_copyable_v<AssetOption>);
 
@@ -63,6 +66,16 @@ struct PortfolioSnapshot {
     static constexpr size_t kMaxPositions = 64;
     pc_account account{};
     bool account_valid{};
+    // `activeAssetData` is account-scoped and only fetched for the selected asset. Keeping its
+    // asset id beside the payload prevents a late response for the previous coin from being
+    // rendered as the current coin's buying power.
+    uint32_t asset_data_asset{PC_ASSET_NONE};
+    pc_asset_data asset_data{};
+    bool asset_data_valid{};
+    // Effective perp rates from `userFees`, on the same 1e8 fraction grid as other fixed-point
+    // values. The maker rate may be negative when the account receives a rebate.
+    pc_fee_rates fee_rates{};
+    bool fee_rates_valid{};
     uint32_t position_count{};
     std::array<portfolio::Position, kMaxPositions> positions{};
 };
@@ -80,14 +93,42 @@ struct SafetySnapshot {
     // pre-computed remaining duration that would go stale between publishes.
     bool dms_active{};  // false until the first heartbeat has actually gone out (see
                         // Engine::tick_dead_mans_switch: gated on an authenticated session)
+    bool dms_unavailable{};  // venue rejected it because the account has not met its volume rule
     uint64_t dms_deadline_ms{};
     uint32_t dms_triggers_remaining_today{10};  // risk::DeadMansSwitch::kMaxTriggersPerUtcDay
 
-    // Market-socket WebSocket ping/pong round trip, microseconds; 0 until first measured.
-    // The ONLY true latency figure in the UI -- the per-feed numbers in the header strip are
-    // push cadences, which describe how often the venue sends rather than how long a packet
-    // takes to arrive.
+    // --- Latency, in two families that must not be confused with each other ---------------
+    //
+    // (a) VENUE latency: WebSocket ping/pong round trip per socket, microseconds; 0 until the
+    //     first measurement. These are the only true *network* figures in the UI -- the
+    //     per-feed numbers in the header strip (bbo/fast/deep) are push cadences, which say
+    //     how often the venue sends rather than how long a packet takes to arrive.
     uint32_t market_rtt_us{};
+    uint32_t user_rtt_us{};
+
+    // (b) LOCAL latency: what this process itself costs, so a slow tick is distinguishable
+    //     from a slow venue. All measured on pc::monotonic_ns(), microseconds.
+    //
+    // `engine_tick_us` is the EWMA of one full engine iteration's *work* (apply the polled
+    // event batch, drain UI commands, run the safety timers, publish) -- the poll wait itself
+    // is excluded, since blocking for events is not latency. `engine_tick_max_us` is the worst
+    // iteration seen in the current measurement window (reset each time it is published), which
+    // is the number that actually matters for a missed quote.
+    uint32_t engine_tick_us{};
+    uint32_t engine_tick_max_us{};
+    // Events applied in the last iteration that had any, and the EWMA cost per event. Together
+    // with the tick figures these answer "is the engine slow, or just busy?".
+    uint32_t engine_batch_events{};
+
+    // UI -> engine command pickup: how long a UiCommand sat in the ring between the UI thread
+    // pushing it and the engine thread popping it. This is the local half of an order's
+    // send-side latency; the venue's half is `market_rtt_us`.
+    uint32_t engine_cmd_us{};
+
+    // pc::monotonic_ns() at the moment this snapshot was published. The UI subtracts its own
+    // monotonic_ns() from it to get snapshot age -- how stale the numbers on screen are
+    // relative to the engine, which no other figure here exposes.
+    uint64_t publish_mono_ns{};
 
     // Rate budget (risk::RateBudget), fed by PC_EV_RATE.
     int32_t rate_budget_bps{10'000};
@@ -177,6 +218,9 @@ struct UiCommand {
     uint8_t mantissa{};     // SetBookAggregation: 0 means "send null"
     bool flatten{};        // KillSwitchTrigger
     pc_order_req order{};  // only populated for PlaceOrder
+    // Stamped by push_command() on the UI thread, read by the engine on pop, to measure the
+    // ring's own handoff latency (SafetySnapshot::engine_cmd_us). Callers never set it.
+    uint64_t enqueue_mono_ns{};
 };
 static_assert(std::is_trivially_copyable_v<UiCommand>);
 
@@ -232,7 +276,9 @@ public:
     void load_safety(SafetySnapshot& out) const noexcept { safety_.load(out); }
     [[nodiscard]] bool try_pop_event(UiEvent& out) noexcept { return events_.try_pop(out); }
     [[nodiscard]] bool push_command(const UiCommand& cmd) noexcept {
-        return commands_.try_push(cmd);
+        UiCommand stamped = cmd;
+        stamped.enqueue_mono_ns = monotonic_ns();
+        return commands_.try_push(stamped);
     }
 
 private:

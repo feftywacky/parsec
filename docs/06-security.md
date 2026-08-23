@@ -34,7 +34,7 @@ highest-value test in the project.
 | Fact | Consequence for parsec |
 |---|---|
 | Default expiry 180 days; custom via `agentName = "<name> valid_until <ms>"`, max 180 days | Store `valid_until_ms`; warn in the UI at 14 days, refuse to start at 0 |
-| 1 unnamed + up to 3 named agents per account | parsec always registers a **named** agent (`parsec-<host>-<short-id>`) so it never silently deregisters another tool's unnamed agent |
+| 1 unnamed + up to 3 named agents per account | parsec always registers a **named** agent (`parsec-<8 hex>`) so it never silently deregisters another tool's unnamed agent. The name is capped at **16 characters** by the venue (03 §`approveAgent`, verified), which is why it is not host-tagged — the random suffix, not the host, is what keeps two machines from evicting each other |
 | A matching-name `approveAgent` deregisters that named agent | Rotation is just re-approving the same name — no orphan agents accumulate |
 | Nonces are tracked **per signer** (the agent address), 100 most recent | One agent per running process. Never share a keystore between two concurrently running parsec instances |
 | **Never reuse an agent address** — after deregistration nonce state may be pruned, making old signed actions replayable | Rotation always generates a **fresh keypair**. Never re-import an old agent key |
@@ -53,7 +53,7 @@ highest-value test in the project.
         │        (stdin, no echo; never a CLI argument, never a file)
         │
         ├─ 3. build + sign `approveAgent` with master_sk   → user-signed EIP-712
-        │        agentName = "parsec-<host>-<id> valid_until <now + 180d>"
+        │        agentName = "parsec-<8 hex> valid_until <now + 180d>"   (name <= 16 chars)
         │
         ├─ 4. POST /exchange, confirm {"status":"ok"}
         │
@@ -68,12 +68,19 @@ The master key exists in the process for the duration of one signature — secon
 never written to disk, never logged, never included in an error message, and never passed as
 an argument (where it would land in shell history and `ps` output).
 
-**Alternative for the paranoid, supported from day one.** `parsec setup --print-approval`
-emits the exact `approveAgent` EIP-712 payload and stops. Sign it wherever you like — MetaMask,
-a hardware wallet, an air-gapped machine — and hand the signature back with
-`parsec setup --signature 0x...`. The master key then never touches this process at all. This
-path costs about thirty lines of code and removes the single largest residual risk, so it is
-in Phase 2, not "later".
+**Implemented** in `rust/src/ffi/setup.rs` (the engine-free `pc_setup_*` ABI) and
+`src/app/cli_setup.cpp` (prompts, argument handling, secret buffers). The agent private key
+is generated inside the `pc_setup` handle and never crosses the ABI; the only call that could
+expose it does not exist and must not be added.
+
+**Removed: the offline `--print-approval` path.** It was implemented and then withdrawn,
+because it could not work as specified: the approval is bound to an agent keypair that exists
+only in the process that printed the payload, so signing elsewhere and handing the signature
+back to a *second* `parsec setup` run would approve a different agent than the one whose key
+was kept. Making it correct requires either keeping one process alive across the out-of-band
+signing step or persisting an unapproved agent key to disk. Neither is worth the CLI surface
+for a single-user tool, so the in-process path (master key resident for one signature, then
+zeroed) is the only onboarding path.
 
 ---
 
@@ -135,6 +142,14 @@ AES-NI dependency, which matters if this ever runs somewhere unusual).
 this, an attacker who cannot decrypt the key could still flip `"network": "testnet"` to
 `"mainnet"` and watch you fire testnet-sized orders at a live book. Authenticating the header
 makes that a decryption failure instead of a very expensive afternoon.
+
+**Unlocking is interactive and asynchronous.** The engine is constructed locked — market
+data must come up whether or not an account is connected — and the passphrase arrives later
+through `pc_unlock`, which returns immediately and runs the derivation on a blocking task.
+This is not a stylistic choice: at ~3.5 s, a synchronous unlock would freeze the render loop
+with a live book on screen. `pc_auth_status` reports `PC_AUTH_LOCKED` / `UNLOCKING` /
+`UNLOCKED` / `FAILED`, plus `PC_AUTH_NO_KEYSTORE` for a fresh install, which the UI must
+treat as "connect an account" rather than prompting for a passphrase that cannot exist.
 
 **Wrong passphrase is indistinguishable from a corrupted file** — both are just AEAD tag
 failures. The error message says so plainly rather than guessing, and never hints at how close
@@ -226,9 +241,11 @@ Enforceable, checkable, and worth a test each:
    contains no key material even in tests, which use freshly generated throwaway keys.
 6. **No telemetry, no crash reporting, no auto-update.** parsec talks to exactly one host: the
    configured Hyperliquid API. Anything else is a bug.
-7. **Mainnet requires two independent signals** — a config flag *and* a typed confirmation at
-   startup. The window title and a persistent header badge show the network at all times, in a
-   different accent colour.
+7. **Approving a mainnet agent requires two independent signals** — a config flag *and* a
+   typed `MAINNET` confirmation in the connect dialog, at the point the master key is used.
+   Unlocking an already-approved keystore is passphrase-only: the approval decision was made
+   once, and re-asking on every launch would train the confirmation away. The window title and
+   a persistent header badge show the network at all times, in a different accent colour.
 
 ---
 

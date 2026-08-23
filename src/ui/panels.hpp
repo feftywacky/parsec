@@ -12,6 +12,7 @@
 #include "core/units.hpp"
 #include "md/market_store.hpp"
 #include "parsec/parsec.h"
+#include "risk/pre_trade.hpp"
 
 namespace pc::ui {
 
@@ -71,6 +72,12 @@ struct PanelContext {
     // Resolved network. Never inferred in a panel -- the network badge is a safety control.
     bool mainnet{false};
 
+    // The account's CONFIGURED risk limits (app::Config::limits, from ~/.parsec/config.json),
+    // not risk::Limits{}. The ticket is the only place these are enforced for a UI-submitted
+    // order -- Engine::drain_ui_commands() calls pc_place_order directly and never runs
+    // risk::check_order -- so a panel constructing its own defaults here silently overrode
+    // whatever the user configured (docs/02 §6.5: "all risk limits are config values").
+    const risk::Limits& limits;
 };
 
 // Milliseconds until the next funding settlement. Hyperliquid funds hourly on the hour (UTC)

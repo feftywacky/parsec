@@ -10,6 +10,9 @@
 #include <cstdio>
 
 #include "core/time.hpp"
+#include "ui/dialog_connect.hpp"
+#include "ui/dialog_reset.hpp"
+#include "ui/dialog_unlock.hpp"
 #include "ui/panels.hpp"
 #include "ui/theme.hpp"
 
@@ -209,6 +212,29 @@ int AppWindow::run() {
     app::AssetUniverseSnapshot universe{};
     app::PortfolioSnapshot portfolio{};
 
+    // Unlocking the keystore is what turns parsec from a market-data viewer into a trading
+    // terminal (docs/06 §2). It is deliberately *not* part of startup: market data must come
+    // up regardless of whether an account is connected, so the dialog is drawn over a running
+    // UI rather than gating it. `unlock` submits to pc_unlock (which returns immediately and
+    // zeroes the buffer) and polls pc_auth_status -- Argon2id's ~3.5s runs on a Rust blocking
+    // task, so frames keep rendering throughout.
+    UnlockDialog unlock;
+    unlock.configure([this](char* passphrase) { return engine_.unlock(passphrase); },
+                     [this] { return engine_.auth_status(); });
+
+    // Shown instead of the unlock dialog when there is no keystore at all -- a first run.
+    // On success it has just written one, so the engine has to be told it exists (it was
+    // created before the file did) and can then be unlocked with the passphrase the user
+    // already chose, rather than asking for it twice.
+    ConnectDialog connect;
+
+    // The way out of both dead ends the other two dialogs cannot resolve: an agent approval
+    // that has lapsed (no passphrase opens it) and a passphrase that is genuinely lost. Both
+    // end in the same place -- delete the local keystores, then onboard again.
+    ResetDialog reset;
+    reset.configure([this] { return engine_.reset_accounts(); },
+                    [this] { return engine_.last_error(); });
+
     while (!glfwWindowShouldClose(window_)) {
         glfwWaitEventsTimeout(1.0 / (active_hold > 0 ? kActiveFps : kIdleFps));
 
@@ -281,8 +307,50 @@ int AppWindow::run() {
                          view_,
                          unix_ms(),
                          sz_decimals,
-                         engine_.mainnet()};
+                         engine_.mainnet(),
+                         engine_.limits()};
         draw_panels(ctx);
+
+        // Drawn last so it lands on top of the docked panels. PC_AUTH_NO_KEYSTORE means no
+        // keystore file exists at all -- a fresh install that has not run `parsec setup` --
+        // which is not a passphrase problem and must not produce a passphrase prompt.
+        const int auth = engine_.auth_status();
+
+        // PC_AUTH_EXPIRED is raised from the keystore's cleartext header before any
+        // passphrase is asked for, so the lapsed case never reaches the unlock dialog. It
+        // used to: the unlock would run, fail deep inside pc_unlock's expiry check, and come
+        // back as the generic PC_AUTH_FAILED the dialog renders as "wrong passphrase" -- a
+        // dead end that blamed the user for a deadline they could do nothing about.
+        if (auth == PC_AUTH_EXPIRED && !reset.is_open() && !unlock.dismissed())
+            reset.open(ResetDialog::Reason::AgentExpired);
+
+        if (reset.is_open()) {
+            if (reset.draw(engine_.mainnet())) {
+                // The keystores are gone, so the engine reports NO_KEYSTORE from here and the
+                // branch below opens onboarding on the next frame. Re-arm the connect dialog
+                // in case it was dismissed or already used earlier in this session.
+                connect.reopen(engine_.keystore_path());
+                // The unlock dialog cached the deleted keystore's header and may be holding
+                // an earlier dismissal; both refer to an account that no longer exists.
+                unlock.rearm();
+            }
+            active_hold = kActiveFrameHold;
+        } else if (auth == PC_AUTH_NO_KEYSTORE && !connect.dismissed()) {
+            if (connect.draw(engine_.mainnet(), engine_.keystore_path())) {
+                engine_.set_keystore_path(connect.keystore_path());
+                engine_.unlock(connect.passphrase_for_unlock());
+                connect.done_with_passphrase();
+            }
+            active_hold = kActiveFrameHold;
+        } else if (auth != PC_AUTH_NO_KEYSTORE && auth != PC_AUTH_UNLOCKED &&
+                   !unlock.dismissed()) {
+            unlock.draw(engine_.mainnet(), engine_.keystore_path());
+            if (unlock.take_reset_request())
+                reset.open(ResetDialog::Reason::UserRequested);
+            // The dialog is interactive every frame it is up, so hold the active frame rate
+            // rather than dropping to the 10 fps idle budget mid-keystroke.
+            active_hold = kActiveFrameHold;
+        }
 
         const bool ui_active =
             io.WantCaptureMouse &&

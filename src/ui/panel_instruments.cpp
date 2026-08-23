@@ -1,7 +1,10 @@
 #include <imgui.h>
 
+#include <cctype>
+#include <cfloat>
 #include <cstdint>
 
+#include "core/time.hpp"
 #include "core/units.hpp"
 #include "ui/app_window.hpp"
 #include "ui/panels.hpp"
@@ -10,6 +13,33 @@
 
 namespace pc::ui {
 namespace {
+
+struct InstrumentPrefs {
+    char coin_filter[64]{};
+    bool coin_combo_open{false};
+};
+InstrumentPrefs g_prefs;
+
+bool contains_coin_name(const char* name, const char* filter) noexcept {
+    if (!filter || !*filter)
+        return true;
+    if (!name)
+        return false;
+
+    for (const char* name_start = name; *name_start; ++name_start) {
+        const char* name_it = name_start;
+        const char* filter_it = filter;
+        while (*name_it && *filter_it &&
+               std::tolower(static_cast<unsigned char>(*name_it)) ==
+                   std::tolower(static_cast<unsigned char>(*filter_it))) {
+            ++name_it;
+            ++filter_it;
+        }
+        if (!*filter_it)
+            return true;
+    }
+    return false;
+}
 
 // (mark - prev_day) / prev_day, as a 1e8-scaled fraction, computed in 128 bits to keep the
 // multiply from overflowing before the divide. Returns 0 if prev_day is unknown (0), which
@@ -43,9 +73,27 @@ void draw_instruments(PanelContext& ctx) {
         }
         ImGui::AlignTextToFramePadding();
         ImGui::SetNextItemWidth(150.0F);
-        if (ImGui::BeginCombo("##coin", active_name)) {
+        const bool combo_open = ImGui::BeginCombo("##coin", active_name);
+        const bool combo_just_opened = combo_open && !g_prefs.coin_combo_open;
+        if (combo_just_opened) {
+            // Start each search from a clean field. This also makes reopening the selector
+            // predictable after a previous filtered selection.
+            g_prefs.coin_filter[0] = '\0';
+        }
+        g_prefs.coin_combo_open = combo_open;
+        if (combo_open) {
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (combo_just_opened)
+                ImGui::SetKeyboardFocusHere();
+            ImGui::InputTextWithHint("##coin_search", "Search token...", g_prefs.coin_filter,
+                                     sizeof(g_prefs.coin_filter));
+
+            bool found_match = false;
             for (uint32_t i = 0; i < ctx.universe.count; ++i) {
                 const auto& option = ctx.universe.assets[i];
+                if (!contains_coin_name(option.name, g_prefs.coin_filter))
+                    continue;
+                found_match = true;
                 const bool selected = option.asset == selected_asset;
                 if (ImGui::Selectable(option.name, selected)) {
                     ctx.view.active_asset = option.asset;
@@ -58,6 +106,8 @@ void draw_instruments(PanelContext& ctx) {
                 if (selected)
                     ImGui::SetItemDefaultFocus();
             }
+            if (!found_match)
+                ImGui::TextDisabled("No matching tokens");
             ImGui::EndCombo();
         }
 
@@ -130,12 +180,21 @@ void draw_instruments(PanelContext& ctx) {
         app::SafetySnapshot safety{};
         ctx.bridge.load_safety(safety);
         const float rtt_ms = static_cast<float>(safety.market_rtt_us) / 1000.0F;
-        ImGui::TextColored(kColorTextMuted, "RTT / feeds (cadence / age)");
+        const float user_rtt_ms = static_cast<float>(safety.user_rtt_us) / 1000.0F;
+        ImGui::TextColored(kColorTextMuted, "Venue RTT / feeds (cadence / age)");
         if (safety.market_rtt_us == 0)
-            ImGui::TextColored(kColorTextMuted, "rtt --");
+            ImGui::TextColored(kColorTextMuted, "mkt --");
         else
-            ImGui::TextColored(rtt_ms > 250.0F ? kColorWarning : kColorTextPrimary, "rtt %.0fms",
+            ImGui::TextColored(rtt_ms > 250.0F ? kColorWarning : kColorTextPrimary, "mkt %.0fms",
                                static_cast<double>(rtt_ms));
+        ImGui::SameLine();
+        // The user socket carries fills and order acks, so its round trip -- not the market
+        // socket's -- is what an order actually pays on the way back.
+        if (safety.user_rtt_us == 0)
+            ImGui::TextColored(kColorTextMuted, "usr --");
+        else
+            ImGui::TextColored(user_rtt_ms > 250.0F ? kColorWarning : kColorTextPrimary,
+                               "usr %.0fms", static_cast<double>(user_rtt_ms));
         ImGui::SameLine();
         ImGui::TextColored(st.bbo_signals != 0 ? kColorWarning : kColorTextPrimary,
                            "| bbo %u/%ums", st.bbo_cadence_ms, st.bbo_age_ms);
@@ -148,14 +207,58 @@ void draw_instruments(PanelContext& ctx) {
         ImGui::EndGroup();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(
-                "rtt:  WebSocket ping/pong round trip -- the only true latency figure here.\n"
-                "      Market data travels ONE way, so a quote arrives about rtt/2 old.\n"
-                "      An order round trip (send -> ack) costs the full rtt.\n\n"
-                "The rest are push cadences: how often the venue sends, not transit time.\n"
+                "VENUE -- WebSocket ping/pong round trip, the only true network figures here.\n"
+                "mkt:  market socket (l2Book/bbo/assetCtx). Market data travels ONE way, so a\n"
+                "      quote arrives about mkt/2 old.\n"
+                "usr:  user socket (fills, order acks). An order round trip (send -> ack)\n"
+                "      costs the full usr rtt.\n\n"
+                "The rest are push CADENCES: how often the venue sends, not transit time.\n"
                 "bbo:  1 level,   ~86ms on mainnet BTC -- sets the ladder's touch.\n"
                 "fast: 5 levels,  ~530ms  (l2Book fast:true).\n"
                 "deep: 20 levels, ~5.4s   (default l2Book) -- fills the tail only.\n"
                 "The ladder composes all three, so the touch is not gated on the slow feed.");
+
+        // --- Local latency: what this process costs, kept visually separate from the venue
+        // figures above so a slow tick is never read as a slow venue. ---
+        ImGui::SameLine(0.0F, 28.0F);
+        ImGui::BeginGroup();
+        ImGui::TextColored(kColorTextMuted, "Engine (tick / cmd / age)");
+        const float tick_ms = static_cast<float>(safety.engine_tick_us) / 1000.0F;
+        const float tick_max_ms = static_cast<float>(safety.engine_tick_max_us) / 1000.0F;
+        ImGui::TextColored(safety.engine_tick_max_us > 5'000 ? kColorWarning : kColorTextPrimary,
+                           "tick %.2f/%.2fms", static_cast<double>(tick_ms),
+                           static_cast<double>(tick_max_ms));
+        ImGui::SameLine();
+        if (safety.engine_cmd_us == 0)
+            ImGui::TextColored(kColorTextMuted, "| cmd --");
+        else
+            ImGui::TextColored(safety.engine_cmd_us > 5'000 ? kColorWarning : kColorTextMuted,
+                               "| cmd %.2fms",
+                               static_cast<double>(safety.engine_cmd_us) / 1000.0);
+        ImGui::SameLine();
+        // Snapshot age: how stale everything on screen is relative to the engine's own state.
+        // Published on the engine's monotonic clock, which is the same clock this reads.
+        const uint64_t now_ns = monotonic_ns();
+        const double snap_age_ms =
+            safety.publish_mono_ns != 0 && now_ns > safety.publish_mono_ns
+                ? static_cast<double>(now_ns - safety.publish_mono_ns) / 1e6
+                : 0.0;
+        ImGui::TextColored(snap_age_ms > 100.0 ? kColorWarning : kColorTextMuted, "| age %.1fms",
+                           snap_age_ms);
+        ImGui::SameLine();
+        ImGui::TextColored(kColorTextMuted, "| batch %u", safety.engine_batch_events);
+        ImGui::EndGroup();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "LOCAL -- this process, not the network. Nothing here crosses the internet.\n"
+                "tick: one engine loop's work (apply events -> UI commands -> timers ->\n"
+                "      publish), shown as EWMA / worst case since the last publish. The\n"
+                "      pc_poll wait is excluded -- blocking on an idle socket is not work.\n"
+                "cmd:  how long a UI command (order, leverage, subscription) waited in the\n"
+                "      SPSC ring before the engine picked it up. The local half of an\n"
+                "      order's send latency; the venue half is the usr rtt on the left.\n"
+                "age:  how old this snapshot is -- engine state -> your screen.\n"
+                "batch: events applied in the last non-empty poll; high means busy, not slow.");
 
         // docs/09-measurements.md §2.1-2.2: funding/OI/volume/mark/oracle were observed
         // parsing as zero on testnet earlier in development, due to a decimal-precision bug

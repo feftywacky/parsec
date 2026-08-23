@@ -5,8 +5,13 @@
 namespace pc::risk {
 
 struct Limits {
-    Usd max_order_notional{25'000 * kScale};
-    Usd max_position_notional{100'000 * kScale};
+    // Fat-finger backstops, not a margin model -- the venue's own margin check is the thing
+    // that decides whether an order is affordable. These exist to catch a size that is wrong by
+    // an order of magnitude, so they sit well above a normal order and are meant to be raised
+    // in ~/.parsec/config.json by anyone trading larger. The 4:1 ratio between them lets a
+    // position be built out of several full-size orders before the position cap bites.
+    Usd max_order_notional{100'000 * kScale};
+    Usd max_position_notional{400'000 * kScale};
     uint32_t max_leverage{10};
     uint32_t max_price_band_bps{1000};
     Usd min_notional{10 * kScale};

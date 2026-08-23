@@ -39,7 +39,7 @@ pub fn derive_address(sk: &SigningKey) -> [u8; 20] {
 
 /// The `approveAgent` action, in the form needed both to sign it and to POST it.
 /// `agent_name` is always `Some` in normal parsec operation — 06 §2 requires a named
-/// agent (`parsec-<host>-<id>`) so parsec never silently deregisters another tool's
+/// agent (`parsec-<8 hex>`) so parsec never silently deregisters another tool's
 /// unnamed agent. The unnamed case (`agent_name: None`) is kept for completeness: per
 /// the Python SDK, an unnamed approval is *signed* with `agentName: ""` but the field
 /// is then omitted entirely from the posted action (03 §3).
@@ -114,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn print_approval_then_signature_flow_matches_direct_signing() {
+    fn digest_and_sign_agree_and_recover_to_the_signer() {
         let master = SigningKey::random(&mut OsRng);
         let req = ApproveAgentRequest {
             hyperliquid_chain: "Testnet",
@@ -123,17 +123,16 @@ mod tests {
             agent_name: Some("parsec-test".to_string()),
             nonce: 1_716_531_066_415,
         };
-        // Offline path: only the digest leaves this process.
+        // The digest computed standalone must be exactly what `sign` signs internally.
         let d = req.digest();
-        let sig_offline = user_signed::sign(
+        let sig_standalone = user_signed::sign(
             &master,
             req.signature_chain_id,
             user_signed::APPROVE_AGENT_TYPE,
             &req.fields(),
         );
-        // Direct path: sign() does the same thing in one call.
         let sig_direct = req.sign(&master);
-        assert_eq!(sig_offline, sig_direct);
+        assert_eq!(sig_standalone, sig_direct);
         // And the digest signed is exactly what `sign` used internally.
         assert_eq!(
             super::super::recover_address(&d, &sig_direct).unwrap(),

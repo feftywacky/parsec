@@ -16,7 +16,10 @@
 //! `OrderRouter`/`Reconciler` then treats those exactly like any other snapshot.
 use crate::codec::{decimal::parse_scaled, info, ws_msg::string};
 use crate::ffi::{
-    fetch::{fetch_open_orders, fetch_user_fills_since, fill_event, push_clearinghouse_state},
+    fetch::{
+        fetch_clearinghouse_state, fetch_open_orders, fetch_user_fills_since, fill_event,
+        push_clearinghouse_state,
+    },
     queue::EventQueue,
     types::*,
 };
@@ -84,6 +87,7 @@ pub async fn run(
                     &registry,
                     &last_seen_fill_ms,
                     &mut backoff,
+                    reconnects,
                 )
                 .await;
             }
@@ -121,6 +125,18 @@ async fn reconcile(
     master: &str,
     last_seen_fill_ms: &AtomicU64,
 ) {
+    // The `clearinghouseState` subscription is the steady-state source of positions and
+    // margin, but its first push can be several seconds out -- and until one lands the C++
+    // engine has no account snapshot, which is what gates its own ~4 s REST reconciler. Pull
+    // it once here so an authenticated session has buying power immediately on connect
+    // instead of waiting on (or deadlocking against) that first subscription push.
+    if let Err(message) = fetch_clearinghouse_state(http, events, registry, master, 0).await {
+        events.push(PcEvent::error(
+            -11,
+            &format!("clearinghouseState reconcile: {message}"),
+            0,
+        ));
+    }
     if let Err(message) = fetch_open_orders(http, events, registry, master, 0).await {
         events.push(PcEvent::error(
             -11,
@@ -144,11 +160,16 @@ async fn run_connection(
     registry: &SharedRegistry,
     last_seen_fill_ms: &Arc<AtomicU64>,
     _backoff: &mut Backoff,
+    reconnects: u32,
 ) {
     let mut ping = tokio::time::interval(Duration::from_secs(50));
     let mut idle = tokio::time::interval(Duration::from_secs(5));
     let mut last_message = tokio::time::Instant::now();
     let mut pings_outstanding: u32 = 0;
+    // Only the oldest unanswered ping is timed; pongs are not correlated to a specific ping,
+    // so timing the newest would under-report RTT whenever one goes missing (same rule as
+    // transport/ws.rs).
+    let mut ping_sent_at: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             _ = ping.tick() => {
@@ -157,6 +178,9 @@ async fn run_connection(
                 }
                 if socket.send(Message::Ping(Vec::new())).await.is_err() {
                     return;
+                }
+                if ping_sent_at.is_none() {
+                    ping_sent_at = Some(tokio::time::Instant::now());
                 }
                 pings_outstanding += 1;
             }
@@ -180,6 +204,10 @@ async fn run_connection(
                 Some(Ok(Message::Pong(_))) => {
                     last_message = tokio::time::Instant::now();
                     pings_outstanding = 0;
+                    if let Some(sent) = ping_sent_at.take() {
+                        let rtt = sent.elapsed().as_micros().min(u32::MAX as u128);
+                        emit_conn_rtt(events, CONN_CONNECTED, reconnects, rtt as u32);
+                    }
                 }
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
                 _ => {}
@@ -193,6 +221,13 @@ const CONN_CONNECTED: u8 = PC_CONN_CONNECTED;
 const CONN_RECONNECTING: u8 = PC_CONN_RECONNECTING;
 
 fn emit_conn(events: &EventQueue, state: u8, reconnects: u32) {
+    emit_conn_rtt(events, state, reconnects, 0)
+}
+
+/// The user socket carries fills and order acks, so its round trip -- not the market socket's
+/// -- is what an order actually pays on the way back. Measured from the same ping/pong probe
+/// transport/ws.rs uses, just on a 50 s interval rather than 5 s.
+fn emit_conn_rtt(events: &EventQueue, state: u8, reconnects: u32, rtt_us: u32) {
     events.push(PcEvent {
         kind: PC_EV_CONN,
         flags: 0,
@@ -205,7 +240,7 @@ fn emit_conn(events: &EventQueue, state: u8, reconnects: u32) {
                 socket: SOCK_USER,
                 state,
                 reconnects,
-                rtt_us: 0, // the user socket carries no latency probe; only the market one does
+                rtt_us,
             },
         },
     });
@@ -221,6 +256,10 @@ fn base(kind: u16, asset: u32, time: u64) -> PcEvent {
         recv_time_ns: crate::ffi::monotonic_ns(),
         u: unsafe { std::mem::zeroed() },
     }
+}
+
+fn clearinghouse_state_payload(data: &Value) -> &Value {
+    data.get("clearinghouseState").unwrap_or(data)
 }
 
 fn parse_event(
@@ -303,9 +342,28 @@ fn parse_event(
             // documented way to get funding history into the event stream.
         }
         "clearinghouseState" => {
-            if let Ok(state) = serde_json::from_value::<info::ClearinghouseState>(data.clone()) {
-                push_clearinghouse_state(events, registry, 0, &state);
+            // Surface a decode failure rather than dropping it: this payload is the only
+            // source of account value / buying power, and silently skipping it looks
+            // identical to "not signed in" everywhere downstream.
+            // The user websocket currently wraps the state as
+            // {"user": ..., "dex": "", "clearinghouseState": {...}}, while the REST
+            // `clearinghouseState` endpoint returns the inner object directly. Accept both
+            // forms because they describe the same account snapshot.
+            let state_value = clearinghouse_state_payload(data);
+            match serde_json::from_value::<info::ClearinghouseState>(state_value.clone()) {
+                Ok(state) => push_clearinghouse_state(events, registry, 0, &state),
+                Err(error) => events.push(PcEvent::error(
+                    -12,
+                    &format!("clearinghouseState decode failed: {error}"),
+                    0,
+                )),
             }
+        }
+        // A rejected subscription (bad address, unknown sub type) comes back on this
+        // channel; swallowing it left the account panes blank with no explanation.
+        "error" => {
+            let text = data.as_str().unwrap_or("unknown user-socket error");
+            events.push(PcEvent::error(-13, text, 0));
         }
         "notification" => {
             if let Some(text) = string(data, "notification") {
@@ -313,5 +371,48 @@ fn parse_event(
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ffi::types::PC_EV_ACCOUNT;
+
+    #[test]
+    fn clearinghouse_state_websocket_envelope_is_unwrapped() {
+        let message = json!({
+            "channel": "clearinghouseState",
+            "data": {
+                "user": "0x0000000000000000000000000000000000000001",
+                "dex": "",
+                "clearinghouseState": {
+                    "assetPositions": [],
+                    "crossMaintenanceMarginUsed": "0.0",
+                    "crossMarginSummary": {
+                        "accountValue": "100.0",
+                        "totalMarginUsed": "0.0",
+                        "totalNtlPos": "0.0",
+                        "totalRawUsd": "100.0"
+                    },
+                    "marginSummary": {
+                        "accountValue": "100.0",
+                        "totalMarginUsed": "0.0",
+                        "totalNtlPos": "0.0",
+                        "totalRawUsd": "100.0"
+                    },
+                    "time": 1,
+                    "withdrawable": "100.0"
+                }
+            }
+        });
+        let events = EventQueue::new(64);
+        let registry = SharedRegistry::empty();
+        let last_seen_fill_ms = AtomicU64::new(0);
+
+        parse_event(&events, &registry, message, &last_seen_fill_ms);
+
+        assert_eq!(events.pop().unwrap().kind, PC_EV_ACCOUNT);
+        assert!(events.pop().is_none());
     }
 }
