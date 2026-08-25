@@ -149,7 +149,9 @@ using SafetySnapshotSlot = SnapshotSlot<SafetySnapshot>;
 // Engine -> UI: discrete events, every one matters (docs/05 §5.2: fills, acks, toasts)
 // ============================================================================================
 
-enum class UiEventKind : uint8_t { Fill, OrderAck, OrderUpdate, Toast, ConnState, Rate };
+enum class UiEventKind : uint8_t {
+    Fill, OrderAck, OrderUpdate, Toast, ConnState, Rate, Funding
+};
 
 struct UiToast {
     char text[128]{};
@@ -163,12 +165,22 @@ struct UiEvent {
     // open-orders row cannot say which instrument it is about.
     uint32_t asset{PC_ASSET_NONE};
     uint64_t recv_time_ns{};
+    // The venue's own timestamp for the event, copied from pc_event::exch_time_ms. This is the
+    // only wall-clock time that reaches the UI -- `recv_time_ns` is a monotonic clock with an
+    // arbitrary epoch, so it can order events but can never date them. Every history table
+    // needs a date, hence this. 0 when the source event carried none.
+    uint64_t exch_time_ms{};
+    // pc_event::flags, forwarded verbatim. The UI needs PC_F_SNAPSHOT_BEGIN/END to rebuild a
+    // list rather than accumulate into it, and PC_F_HISTORICAL to tell an order's past from
+    // its present -- both arrive as the same event kind.
+    uint16_t flags{};
     union {
         pc_fill fill;
         pc_order_ack ack;
         pc_order_update order_update;
         pc_conn conn;
         pc_rate rate;
+        pc_funding funding;
         UiToast toast;
     } u{};
 };

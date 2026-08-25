@@ -29,8 +29,8 @@ namespace {
 // and CMakeLists.txt is out of scope for this change. Pulling in a real dependency would mean
 // either editing the build file this task explicitly leaves alone, or silently failing to
 // compile -- neither is acceptable, so config parsing is self-contained instead. The format
-// this reads/writes is deliberately simple (flat object, one nested "limits" object, one
-// array of strings) so a hand-rolled parser is a reasonable size, not a liability.
+// this reads/writes is deliberately simple (a flat object of scalars) so a
+// hand-rolled parser is a reasonable size, not a liability.
 // ------------------------------------------------------------------------------------------
 
 struct JVal;
@@ -262,22 +262,6 @@ void get_u64(const JObject& obj, const char* key, uint64_t& out) noexcept {
             if (*n >= 0)
                 out = static_cast<uint64_t>(*n);
 }
-void get_u32(const JObject& obj, const char* key, uint32_t& out) noexcept {
-    const auto it = obj.find(key);
-    if (it != obj.end())
-        if (const double* n = it->second.as_number())
-            if (*n >= 0)
-                out = static_cast<uint32_t>(*n);
-}
-// Risk limits and notionals are stored in plain USD in the file (human-editable), scaled by
-// kScale on the way in/out -- config.json should never expose the 1e8 fixed-point internals.
-void get_usd(const JObject& obj, const char* key, Usd& out) noexcept {
-    const auto it = obj.find(key);
-    if (it != obj.end())
-        if (const double* n = it->second.as_number())
-            out = static_cast<Usd>(*n) * kScale;
-}
-
 std::string json_escape(const std::string& s) {
     std::string out;
     out.reserve(s.size());
@@ -364,16 +348,6 @@ Config Config::load(const std::string& path) noexcept {
             get_i64(*obj, "default_slippage_bps", slip);
             cfg.default_slippage_bps = static_cast<int32_t>(slip);
         }
-
-        if (const auto it = obj->find("limits"); it != obj->end()) {
-            if (const JObject* limits = it->second.as_object()) {
-                get_usd(*limits, "max_order_notional_usd", cfg.limits.max_order_notional);
-                get_usd(*limits, "max_position_notional_usd", cfg.limits.max_position_notional);
-                get_u32(*limits, "max_leverage", cfg.limits.max_leverage);
-                get_u32(*limits, "max_price_band_bps", cfg.limits.max_price_band_bps);
-                get_usd(*limits, "min_notional_usd", cfg.limits.min_notional);
-            }
-        }
     } catch (const std::exception& e) {
         // Malformed JSON must never throw into the engine -- fall back to defaults() field for
         // field (whatever parsed before the failure is discarded; cfg is still the pristine
@@ -406,15 +380,7 @@ bool Config::save(const std::string& path) const noexcept {
     file << "  \"master_address\": \"" << json_escape(master_address) << "\",\n";
     file << "  \"order_ack_timeout_ms\": " << order_ack_timeout_ms << ",\n";
     file << "  \"dms_heartbeat_interval_ms\": " << dms_heartbeat_interval_ms << ",\n";
-    file << "  \"default_slippage_bps\": " << default_slippage_bps << ",\n";
-    file << "  \"limits\": {\n";
-    file << "    \"max_order_notional_usd\": " << (limits.max_order_notional / kScale) << ",\n";
-    file << "    \"max_position_notional_usd\": " << (limits.max_position_notional / kScale)
-         << ",\n";
-    file << "    \"max_leverage\": " << limits.max_leverage << ",\n";
-    file << "    \"max_price_band_bps\": " << limits.max_price_band_bps << ",\n";
-    file << "    \"min_notional_usd\": " << (limits.min_notional / kScale) << "\n";
-    file << "  }\n";
+    file << "  \"default_slippage_bps\": " << default_slippage_bps << "\n";
     file << "}\n";
 
     return file.good();

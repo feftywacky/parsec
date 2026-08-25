@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define PC_ABI_VERSION 1u
+#define PC_ABI_VERSION 3u
 #define PC_COIN_LEN 16
 #define PC_ERR_LEN 192
 #define PC_MAX_LEVELS 24
@@ -48,6 +48,13 @@ enum {
        the venue's single `l2Book` channel with nothing in the payload to tell them apart, so
        the Rust edge classifies by depth -- see rust/src/transport/ws.rs. */
     PC_F_L2_FAST = 1u << 5,
+    /* PC_EV_ORDER_UPDATE only: this event describes an order's PAST, not its present. Both
+       `frontendOpenOrders` (what is resting right now) and `historicalOrders` (everything
+       that ever happened) arrive as PC_EV_ORDER_UPDATE snapshot batches, and they answer
+       different questions -- without this bit a consumer cannot tell an order that is still
+       resting from one that resolved days ago, and a history backfill silently repopulates
+       the open-orders list. Set on every `historicalOrders` event and on nothing else. */
+    PC_F_HISTORICAL = 1u << 6,
 };
 
 /* Candle interval ids. Passed as pc_subscribe's `interval` argument alongside
@@ -110,8 +117,22 @@ typedef struct { pc_qty max_trade_buy,max_trade_sell; pc_usd avail_buy,avail_sel
    1e8 grid: 0.00045 (0.045%) is 45000. `maker_rate` may be negative when the account
    receives a maker rebate. */
 typedef struct { int64_t maker_rate, taker_rate; } pc_fee_rates;
-typedef struct { uint64_t oid; uint8_t cloid[16]; uint16_t status; pc_px px; pc_qty sz,orig_sz; uint8_t is_buy,reduce_only; } pc_order_update;
-typedef struct { uint64_t oid,tid; uint8_t cloid[16]; pc_px px; pc_qty qty; pc_usd fee,closed_pnl; uint8_t is_buy,is_taker; } pc_fill;
+/* `trigger_px` and `tpsl` (PC_TPSL_*) are populated only for trigger orders, i.e. a resting
+   take-profit or stop-loss. For those, `px` is the LIMIT price the order becomes once it
+   fires -- for a market trigger that is a slippage-padded price far from where the order
+   actually rests, so `trigger_px` is the only price that means "where this order sits".
+   The `orderUpdates` WS payload carries none of these fields (03 SS W2.7); they arrive with
+   the `frontendOpenOrders` snapshot the reconciler re-pulls. */
+typedef struct { uint64_t oid; uint8_t cloid[16]; uint16_t status; pc_px px; pc_qty sz,orig_sz; pc_px trigger_px; uint8_t is_buy,reduce_only,is_trigger,tpsl,is_market_trigger; } pc_order_update;
+/* pc_fill::dir. The venue's own `dir` string on `userFills` (03 SS W2.9), which says what the
+   fill DID to the position -- opened it, closed it, or flipped it -- and is not derivable from
+   the side alone: a sell is an opening short or a closing long depending on what was held. */
+enum {
+    PC_DIR_UNKNOWN = 0, PC_DIR_OPEN_LONG, PC_DIR_CLOSE_LONG, PC_DIR_OPEN_SHORT,
+    PC_DIR_CLOSE_SHORT, PC_DIR_LONG_TO_SHORT, PC_DIR_SHORT_TO_LONG, PC_DIR_LIQUIDATION,
+    PC_DIR_BUY, PC_DIR_SELL
+};
+typedef struct { uint64_t oid,tid; uint8_t cloid[16]; pc_px px; pc_qty qty; pc_usd fee,closed_pnl; uint8_t is_buy,is_taker,dir; } pc_fill;
 typedef struct { pc_qty szi; pc_px entry_px,liq_px; pc_usd position_value,unrealized_pnl,margin_used,cum_funding; int32_t roe_bps; uint32_t leverage; uint8_t is_cross; } pc_position;
 typedef struct { pc_usd account_value,total_margin_used,total_ntl_pos,withdrawable,cross_maintenance_margin; } pc_account;
 typedef struct { uint16_t status; uint64_t oid; pc_qty filled_sz; pc_px avg_px; char err[PC_ERR_LEN]; } pc_order_ack;

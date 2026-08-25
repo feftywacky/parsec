@@ -148,3 +148,16 @@ TEST_CASE("format_px never shows more decimals than the venue's price precision 
         }
     }
 }
+
+TEST_CASE("format_usd_fine keeps sub-cent amounts visible") {
+    char buf[48];
+    // The reported case: a 0.045% taker fee on a $10.91 order is ~$0.0049, which format_usd
+    // renders as "$0.00" -- indistinguishable from no fee at all.
+    CHECK(std::string(format_usd(490'000, buf, sizeof(buf))) == "$0.00");
+    CHECK(std::string(format_usd_fine(490'000, buf, sizeof(buf))) == "$0.004900");
+    CHECK(std::string(format_usd_fine(-490'000, buf, sizeof(buf))) == "-$0.004900");
+    // At a dollar and above it stays the familiar two-decimal, grouped form.
+    CHECK(std::string(format_usd_fine(1234 * kScale + kScale / 2, buf, sizeof(buf))) ==
+          "$1,234.50");
+    CHECK(std::string(format_usd_fine(0, buf, sizeof(buf))) == "$0.00");
+}

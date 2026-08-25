@@ -61,11 +61,6 @@ public:
     // (docs/07 Phase 7 requirement 5), so it has to reach the UI rather than being assumed.
     [[nodiscard]] bool mainnet() const noexcept { return mainnet_; }
 
-    // The configured risk limits (docs/02 §6.5). The order ticket gates on these before it
-    // pushes a PlaceOrder command, so it must read the same values this engine was built with
-    // rather than default-constructing risk::Limits{}.
-    [[nodiscard]] const risk::Limits& limits() const noexcept { return config_.limits; }
-
     [[nodiscard]] uint32_t active_asset() const noexcept {
         return active_asset_.load(std::memory_order_relaxed);
     }
@@ -169,6 +164,14 @@ private:
     // Bitset of PC_IV_* timeframes already subscribed for the active coin; see
     // subscribe_interval().
     uint64_t subscribed_intervals_{};
+    // The chart timeframe the UI is currently showing. Kept so a market-socket reconnect can
+    // re-subscribe and re-backfill it -- subscribed_intervals_ alone only records what was
+    // *asked for*, and an ask issued before the socket came up buys nothing.
+    uint8_t active_interval_{};
+    // Whether the market socket has been seen connected. A subscribe issued while it is down
+    // is dropped by the venue transport, and subscribed_intervals_ would still latch it as
+    // done -- which is how a cold start could leave the chart permanently empty.
+    bool market_connected_{};
 
     // Last WebSocket ping/pong round trip per socket, microseconds. Fed by the pong-carried
     // PC_EV_CONN heartbeat, republished to the UI in every SafetySnapshot.
@@ -229,6 +232,11 @@ private:
     std::vector<uint32_t> reconcile_batch_{};  // assets touched by the snapshot batch in flight
     uint64_t last_reconcile_fetch_ms_{};
     uint64_t last_fee_rates_fetch_ms_{};
+    // One-shot history backfill (fills, funding payments, terminal orders). Issued once the
+    // first account snapshot proves the session is authenticated -- before that the venue has
+    // no user to answer for. The three history tables are session logs fed by live streams;
+    // this is what gives them anything to show from before the app was opened.
+    bool history_backfilled_{};
     uint64_t last_asset_data_fetch_ms_{};
     uint32_t reconcile_divergence_count_{};
     bool reconcile_alarm_{};

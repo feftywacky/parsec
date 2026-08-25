@@ -13,6 +13,33 @@ TEST_CASE("order preview reports initial margin and effective fee in fixed-point
     CHECK(maintenance_rate_for_max_leverage(50) == kScale / 100);
 }
 
+TEST_CASE("order preview maintenance margin is sign-agnostic in the position's direction") {
+    const Usd rate = kScale / 100;  // 1%, i.e. maintenance_rate_for_max_leverage(50)
+    CHECK(maintenance_margin(100 * kScale, rate) == kScale);
+    // A short's position_value arrives negative on some paths; the requirement is the same.
+    CHECK(maintenance_margin(-100 * kScale, rate) == kScale);
+    CHECK(maintenance_margin(0, rate) == 0);
+    CHECK(maintenance_margin(100 * kScale, 0) == 0);
+}
+
+TEST_CASE("order preview liquidation estimate matches an isolated position's own margin") {
+    // The positions panel's fallback when the venue has not published liquidationPx yet:
+    // 5.6 units at 1.9491 on 10x isolated, i.e. $10.91 notional behind $1.09 of margin, on a
+    // coin whose max leverage is 10 (maintenance rate 5%).
+    const Px entry = 194'910'000;             // 1.9491
+    const Qty size = 5 * kScale + kScale * 6 / 10;  // 5.6
+    const Usd position_value = notional(entry, size);
+    const Usd rate = maintenance_rate_for_max_leverage(10);
+    const Usd margin_used = initial_margin(position_value, 10);
+    const Usd available = margin_used - maintenance_margin(position_value, rate);
+
+    const Px liq = estimated_liquidation_price(entry, size, available, rate);
+    // Within a cent of the ~1.847 the ticket previews for the same position.
+    CHECK(liq > 184'000'000);
+    CHECK(liq < 185'500'000);
+    CHECK(liq < entry);  // a long is liquidated below its entry
+}
+
 TEST_CASE("order preview converts a USDC notional to base quantity") {
     CHECK(qty_from_notional(100 * kScale, 20 * kScale) == 5 * kScale);
     CHECK(qty_from_notional(0, 20 * kScale) == 0);

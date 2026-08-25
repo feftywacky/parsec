@@ -38,6 +38,9 @@ pub const PC_F_SNAPSHOT_END: u16 = 1 << 2;
 /// PC_EV_L2_BOOK only: this snapshot came from the `fast:true` l2Book subscription rather than
 /// the default one. Mirrors PC_F_L2_FAST in include/parsec/parsec.h.
 pub const PC_F_L2_FAST: u16 = 1 << 5;
+/// `PC_EV_ORDER_UPDATE` only: this event describes an order's past, not its present. Set on
+/// every `historicalOrders` event so a consumer can tell it from a `frontendOpenOrders` one.
+pub const PC_F_HISTORICAL: u16 = 1 << 6;
 
 // ---- pc_order_update::status (PC_ORD_*) ----
 pub const PC_ORD_UNKNOWN: u16 = 0;
@@ -83,6 +86,18 @@ pub const PC_TIF_GTC: u8 = 0;
 pub const PC_TIF_IOC: u8 = 1;
 pub const PC_TIF_ALO: u8 = 2;
 pub const PC_TIF_FRONTEND_MARKET: u8 = 3;
+
+// ---- pc_fill::dir (PC_DIR_*) ----
+pub const PC_DIR_UNKNOWN: u8 = 0;
+pub const PC_DIR_OPEN_LONG: u8 = 1;
+pub const PC_DIR_CLOSE_LONG: u8 = 2;
+pub const PC_DIR_OPEN_SHORT: u8 = 3;
+pub const PC_DIR_CLOSE_SHORT: u8 = 4;
+pub const PC_DIR_LONG_TO_SHORT: u8 = 5;
+pub const PC_DIR_SHORT_TO_LONG: u8 = 6;
+pub const PC_DIR_LIQUIDATION: u8 = 7;
+pub const PC_DIR_BUY: u8 = 8;
+pub const PC_DIR_SELL: u8 = 9;
 
 // ---- pc_order::tpsl (PC_TPSL_*) ----
 pub const PC_TPSL_NONE: u8 = 0;
@@ -211,8 +226,17 @@ pub struct PcOrderUpdate {
     pub px: i64,
     pub sz: i64,
     pub orig_sz: i64,
+    /// Where a trigger order actually rests. `px` is the limit it converts to once it
+    /// fires, which for a market trigger is deliberately far from the market.
+    pub trigger_px: i64,
     pub is_buy: u8,
     pub reduce_only: u8,
+    pub is_trigger: u8,
+    /// `PC_TPSL_*`: which leg a trigger order is. `PC_TPSL_NONE` for a plain order.
+    pub tpsl: u8,
+    /// Whether a trigger order converts to a market order (rather than a limit) when it
+    /// fires. Together with `tpsl` this is what names the order type in a history table.
+    pub is_market_trigger: u8,
 }
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -226,6 +250,8 @@ pub struct PcFill {
     pub closed_pnl: i64,
     pub is_buy: u8,
     pub is_taker: u8,
+    /// `PC_DIR_*`: what the fill did to the position, from the venue's `dir` string.
+    pub dir: u8,
 }
 #[repr(C)]
 #[derive(Copy, Clone)]

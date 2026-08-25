@@ -12,7 +12,6 @@
 #include "core/units.hpp"
 #include "md/market_store.hpp"
 #include "parsec/parsec.h"
-#include "risk/pre_trade.hpp"
 
 namespace pc::ui {
 
@@ -71,13 +70,6 @@ struct PanelContext {
 
     // Resolved network. Never inferred in a panel -- the network badge is a safety control.
     bool mainnet{false};
-
-    // The account's CONFIGURED risk limits (app::Config::limits, from ~/.parsec/config.json),
-    // not risk::Limits{}. The ticket is the only place these are enforced for a UI-submitted
-    // order -- Engine::drain_ui_commands() calls pc_place_order directly and never runs
-    // risk::check_order -- so a panel constructing its own defaults here silently overrode
-    // whatever the user configured (docs/02 §6.5: "all risk limits are config values").
-    const risk::Limits& limits;
 };
 
 // Milliseconds until the next funding settlement. Hyperliquid funds hourly on the hour (UTC)
@@ -90,6 +82,12 @@ inline uint64_t ms_to_next_funding(uint64_t now_ms) noexcept {
 }
 
 // --- Phase 2: the read-only terminal ---
+// The top strip: which network this build is pointed at, whether the feed is live, and the
+// venue/engine latency figures. Drawn inside the dockspace host's menu bar rather than in a
+// panel -- these are session-wide facts about the connection, not facts about the selected
+// instrument, and they were competing with the price metrics for room in the header strip.
+void draw_menu_bar_status(PanelContext& ctx);
+
 void draw_instruments(PanelContext& ctx);
 void draw_chart(PanelContext& ctx);
 void draw_book(PanelContext& ctx);

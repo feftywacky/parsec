@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <ctime>
 
 namespace pc::ui {
 namespace {
@@ -119,6 +121,12 @@ const char* format_usd(Usd value, char* out, size_t cap) noexcept {
     return format_scaled(value, /*decimals=*/2, /*grouped=*/true, /*dollar_sign=*/true, out, cap);
 }
 
+const char* format_usd_fine(Usd value, char* out, size_t cap) noexcept {
+    const Usd magnitude = value < 0 ? -value : value;
+    const int decimals = (magnitude != 0 && magnitude < kScale) ? 6 : 2;
+    return format_scaled(value, decimals, /*grouped=*/true, /*dollar_sign=*/true, out, cap);
+}
+
 const char* format_pct(int64_t value_1e8, int decimals, char* out, size_t cap) noexcept {
     // value_1e8 is a fraction scaled by kScale (e.g. 0.0125% == 0.000125 -> 12500 at 1e8); the
     // percentage itself is that fraction x 100, still on the same 1e8 grid, computed in 128
@@ -147,6 +155,56 @@ const char* format_pct(int64_t value_1e8, int decimals, char* out, size_t cap) n
         out[copy_n] = '\0';
     }
     return out;
+}
+
+const char* format_time_ms(uint64_t unix_ms, char* out, size_t cap) noexcept {
+    if (cap == 0)
+        return out;
+    if (unix_ms == 0) {
+        std::snprintf(out, cap, "--");
+        return out;
+    }
+    const std::time_t seconds = static_cast<std::time_t>(unix_ms / 1000);
+    std::tm tm{};
+    if (localtime_r(&seconds, &tm) == nullptr) {
+        std::snprintf(out, cap, "--");
+        return out;
+    }
+    std::snprintf(out, cap, "%d/%d/%d - %02d:%02d:%02d", tm.tm_mon + 1, tm.tm_mday,
+                  tm.tm_year + 1900, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    return out;
+}
+
+bool parse_fixed(const char* text, int64_t* out) noexcept {
+    if (!text || !*text)
+        return false;
+    int64_t whole = 0;
+    int64_t frac = 0;
+    int frac_digits = 0;
+    bool seen_dot = false;
+    bool any_digit = false;
+    for (const char* p = text; *p; ++p) {
+        if (*p == '.' && !seen_dot) {
+            seen_dot = true;
+            continue;
+        }
+        if (*p < '0' || *p > '9')
+            return false;
+        any_digit = true;
+        if (!seen_dot) {
+            whole = whole * 10 + (*p - '0');
+        } else if (frac_digits < 8) {
+            frac = frac * 10 + (*p - '0');
+            ++frac_digits;
+        }
+    }
+    if (!any_digit)
+        return false;
+    int64_t scale_left = kScale;
+    for (int i = 0; i < frac_digits; ++i)
+        scale_left /= 10;
+    *out = whole * kScale + frac * scale_left;
+    return true;
 }
 
 }  // namespace pc::ui

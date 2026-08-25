@@ -58,7 +58,7 @@ public:
     // pc_order with a fresh cloid. Does not touch OrderStateBook -- that only happens once the
     // caller has actually submitted the order, via on_submitted().
     RouteResult build_order(const RouteRequest& req, AssetPrecision precision,
-                            const risk::RiskContext& risk_ctx, const risk::Limits& limits) noexcept;
+                            const risk::RiskContext& risk_ctx) noexcept;
 
     // Call once pc_place_order has returned req_id for `order` (as built by build_order), to
     // start tracking it as PendingNew with an ack deadline of now_ms + ack_timeout_ms.

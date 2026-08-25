@@ -14,8 +14,7 @@ void OrderRouter::make_cloid(uint8_t out[16]) noexcept {
 }
 
 RouteResult OrderRouter::build_order(const RouteRequest& req, AssetPrecision precision,
-                                     const risk::RiskContext& risk_ctx,
-                                     const risk::Limits& limits) noexcept {
+                                     const risk::RiskContext& risk_ctx) noexcept {
     RouteResult result{};
 
     const Qty qty = Rounder::round_sz(req.raw_qty, precision);
@@ -39,8 +38,7 @@ RouteResult OrderRouter::build_order(const RouteRequest& req, AssetPrecision pre
         return result;
     }
 
-    const risk::OrderIntent intent{px, qty, req.leverage};
-    const auto outcome = risk::check_order(intent, risk_ctx, limits);
+    const auto outcome = risk::check_order(risk_ctx);
     if (!outcome.ok) {
         result.risk = outcome;
         return result;

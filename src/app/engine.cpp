@@ -217,7 +217,8 @@ void Engine::select_asset(uint32_t asset, uint8_t interval) noexcept {
         pc_fetch(ffi_, PC_FETCH_ACTIVE_ASSET_DATA, active_coin_);
         last_asset_data_fetch_ms_ = unix_ms();
     }
-    subscribe_interval(asset, interval);
+    active_interval_ = interval < PC_IV_COUNT ? interval : kDefaultInterval;
+    subscribe_interval(asset, active_interval_);
 }
 
 void Engine::apply_event(const pc_event& event) noexcept {
@@ -243,10 +244,30 @@ void Engine::apply_event(const pc_event& event) noexcept {
             break;
 
         case PC_EV_ACCOUNT:
+            // An account event carrying SNAPSHOT_BEGIN means the clearinghouseState batch it
+            // closes contained NO positions at all -- the Rust layer brackets the batch across
+            // the position events and the account event, so with an empty `assetPositions` the
+            // BEGIN flag lands here instead (see push_clearinghouse_state). Without this the
+            // PC_EV_POSITION arm below never runs, positions_ is never cleared, and the last
+            // position a trader closed stays on screen for the rest of the session.
+            if (event.flags & PC_F_SNAPSHOT_BEGIN) {
+                positions_.clear();
+                reconcile_batch_.clear();
+            }
             account_ = event.u.account;
             account_valid_ = true;
             // Re-bases both AccountState's authoritative and optimistic views (docs/02 §6.4).
             account_state_.apply_authoritative(event.u.account);
+            // First proof this session is authenticated: pull the history the three history
+            // tables would otherwise only be able to show from the moment the app opened.
+            // Once, not on a cadence -- these are logs, and the live streams keep them current
+            // from here on.
+            if (!history_backfilled_) {
+                history_backfilled_ = true;
+                pc_fetch(ffi_, PC_FETCH_USER_FILLS, nullptr);
+                pc_fetch(ffi_, PC_FETCH_USER_FUNDING, nullptr);
+                pc_fetch(ffi_, PC_FETCH_HISTORICAL_ORDERS, nullptr);
+            }
             if (active_coin_[0] != '\0' &&
                 unix_ms() - last_asset_data_fetch_ms_ >= kAssetDataRefreshIntervalMs) {
                 pc_fetch(ffi_, PC_FETCH_ACTIVE_ASSET_DATA, active_coin_);
@@ -278,6 +299,8 @@ void Engine::apply_event(const pc_event& event) noexcept {
             ui.kind = UiEventKind::OrderAck;
             ui.asset = event.asset;
             ui.recv_time_ns = event.recv_time_ns;
+            ui.exch_time_ms = event.exch_time_ms;
+            ui.flags = event.flags;
             ui.u.ack = event.u.ack;
             bridge_.push_event(ui);
             break;
@@ -289,6 +312,8 @@ void Engine::apply_event(const pc_event& event) noexcept {
             ui.kind = UiEventKind::OrderUpdate;
             ui.asset = event.asset;
             ui.recv_time_ns = event.recv_time_ns;
+            ui.exch_time_ms = event.exch_time_ms;
+            ui.flags = event.flags;
             ui.u.order_update = event.u.order_update;
             bridge_.push_event(ui);
             break;
@@ -317,7 +342,25 @@ void Engine::apply_event(const pc_event& event) noexcept {
             ui.kind = UiEventKind::Fill;
             ui.asset = event.asset;
             ui.recv_time_ns = event.recv_time_ns;
+            ui.exch_time_ms = event.exch_time_ms;
+            ui.flags = event.flags;
             ui.u.fill = event.u.fill;
+            bridge_.push_event(ui);
+            break;
+        }
+
+        case PC_EV_FUNDING: {
+            // Funding payments are pure history -- nothing in the engine's own state depends
+            // on them, so they are forwarded straight through to the UI's session log rather
+            // than accumulated here. The venue's timestamp rides along, since a funding row
+            // without its hour is not a funding row.
+            UiEvent ui{};
+            ui.kind = UiEventKind::Funding;
+            ui.asset = event.asset;
+            ui.recv_time_ns = event.recv_time_ns;
+            ui.exch_time_ms = event.exch_time_ms;
+            ui.flags = event.flags;
+            ui.u.funding = event.u.funding;
             bridge_.push_event(ui);
             break;
         }
@@ -329,6 +372,8 @@ void Engine::apply_event(const pc_event& event) noexcept {
             ui.kind = UiEventKind::Rate;
             ui.asset = event.asset;
             ui.recv_time_ns = event.recv_time_ns;
+            ui.exch_time_ms = event.exch_time_ms;
+            ui.flags = event.flags;
             ui.u.rate = event.u.rate;
             bridge_.push_event(ui);
             break;
@@ -346,10 +391,40 @@ void Engine::apply_event(const pc_event& event) noexcept {
                 if (event.u.conn.state == PC_CONN_CONNECTED)
                     break;
             }
+            if (event.u.conn.socket == PC_SOCK_MARKET) {
+                const bool now_connected = event.u.conn.state == PC_CONN_CONNECTED;
+                // Re-arm every market subscription on a rising edge. Two cases land here and
+                // both used to leave the chart blank until the user touched a control:
+                //
+                //  1. Cold start. select_asset() runs as soon as the asset universe resolves,
+                //     which can be before the market socket finishes connecting. The candle
+                //     subscribe and its REST backfill are then sent into a socket that is not
+                //     up, are dropped, and subscribed_intervals_ latches the timeframe as
+                //     already done -- so nothing ever retries and the chart stays empty for
+                //     the whole session.
+                //  2. A reconnect after a drop, where the venue has forgotten our subs
+                //     entirely and nothing was re-sent.
+                //
+                // Clearing the bitset (rather than tracking per-stream acks) keeps this to one
+                // idempotent path: subscribe_interval() re-sends the subscribe and re-fetches
+                // the snapshot, and CandleSeries::backfill() already ignores anything that
+                // overlaps what is cached, so a redundant re-arm costs one request and
+                // duplicates no data.
+                if (now_connected && !market_connected_ && active_coin_[0] != '\0') {
+                    subscribed_intervals_ = 0;
+                    pc_subscribe_book(ffi_, active_coin_, kMarketStreams, book_n_sig_figs_,
+                                      book_mantissa_);
+                    subscribe_interval(active_asset_.load(std::memory_order_relaxed),
+                                       active_interval_);
+                }
+                market_connected_ = now_connected;
+            }
             UiEvent ui{};
             ui.kind = UiEventKind::ConnState;
             ui.asset = event.asset;
             ui.recv_time_ns = event.recv_time_ns;
+            ui.exch_time_ms = event.exch_time_ms;
+            ui.flags = event.flags;
             ui.u.conn = event.u.conn;
             bridge_.push_event(ui);
             break;
@@ -432,6 +507,10 @@ void Engine::drain_ui_commands() noexcept {
                 pc_set_leverage(ffi_, cmd.asset, cmd.is_cross, cmd.leverage);
                 break;
             case UiCommandKind::SetInterval:
+                // Recorded before subscribing so a reconnect re-arms the timeframe the chart
+                // is actually showing, not whichever one happened to be selected at startup.
+                if (cmd.interval < PC_IV_COUNT)
+                    active_interval_ = cmd.interval;
                 subscribe_interval(cmd.asset, cmd.interval);
                 break;
             case UiCommandKind::SetBookAggregation:

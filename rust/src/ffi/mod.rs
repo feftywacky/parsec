@@ -215,7 +215,7 @@ fn command(engine: &PcEngine, value: Command) -> u64 {
 }
 #[no_mangle]
 pub extern "C" fn pc_abi_version() -> u32 {
-    1
+    3
 }
 /// # Safety
 /// `cfg` must be null or point to a valid, readable/writable `PcConfig` for the
@@ -228,7 +228,7 @@ pub unsafe extern "C" fn pc_engine_create(cfg: *mut PcConfig) -> *mut PcEngine {
             return ptr::null_mut();
         }
         let config = unsafe { &mut *cfg };
-        if config.abi_version != 1 {
+        if config.abi_version != 3 {
             return ptr::null_mut();
         }
         // rustls ships with NO default process-level `CryptoProvider` even when
@@ -1152,7 +1152,7 @@ mod auth_tests {
     /// `Engine::start` actually produces now that unlocking is interactive.
     fn config(path: &str, mainnet: bool) -> PcConfig {
         let mut cfg = PcConfig {
-            abi_version: 1,
+            abi_version: 3,
             mainnet,
             keystore_path: [0; 512],
             passphrase: [0; 256],

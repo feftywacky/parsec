@@ -3,13 +3,12 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <random>
 
 #include "exec/rounder.hpp"
 #include "exec/slippage.hpp"
 #include "portfolio/order_preview.hpp"
-#include "risk/pre_trade.hpp"
 #include "ui/app_window.hpp"
+#include "ui/cloid.hpp"
 #include "ui/panels.hpp"
 #include "ui/theme.hpp"
 #include "ui/ui_event_store.hpp"
@@ -58,6 +57,12 @@ struct TicketPrefs {
     char submit_note[128]{};
     uint64_t submit_note_ms{};
     bool submit_note_error{};
+    // High-water mark of toasts already mirrored into `submit_note`. The venue's rejections
+    // ("Insufficient margin", "Price too far from oracle", ...) arrive as toasts and otherwise
+    // only render in the Status tab, which is docked behind Positions -- nowhere near where a
+    // trader is looking when an order fails. Counting rather than timestamping means a repeated
+    // identical rejection still re-announces itself.
+    uint64_t seen_toasts{};
     uint32_t settings_asset{PC_ASSET_NONE};
     bool settings_touched{false};
 };
@@ -67,55 +72,6 @@ TicketPrefs g_prefs;
 // selector and the "Mid" shortcut can sit on the same row, which means the width has to be set
 // explicitly rather than inherited from the default full-width item.
 constexpr float kFieldWidth = 150.0F;
-
-// Every order needs a cloid (docs/02 §6.2), but the stateful session-id/sequence scheme that
-// makes cloids collision-free and reconciliation-friendly lives in exec::OrderRouter, which is
-// engine-owned state this panel must not instantiate a second copy of (that would violate the
-// "panels hold no state" rule and desync from the engine's own bookkeeping). This generates a
-// locally-unique-enough tag instead so the order is never sent with an all-zero cloid; the
-// engine/OrderRouter remains the authority for cloid-based reconciliation.
-void make_local_cloid(uint8_t out[16], uint64_t now_ms) noexcept {
-    static std::mt19937_64 rng{std::random_device{}()};
-    const uint64_t r = rng();
-    std::memcpy(out, &now_ms, 8);
-    std::memcpy(out + 8, &r, 8);
-}
-
-// Parses a decimal string like "118342.5" into a kScale-scaled integer. Returns false (leaving
-// *out at 0) on anything that isn't a plain non-negative decimal -- good enough for a text
-// field the ticket is about to run through exec::Rounder anyway, and it never silently accepts
-// garbage as zero.
-bool parse_fixed(const char* text, Px* out) noexcept {
-    if (!text || !*text)
-        return false;
-    int64_t whole = 0;
-    int64_t frac = 0;
-    int frac_digits = 0;
-    bool seen_dot = false;
-    bool any_digit = false;
-    for (const char* p = text; *p; ++p) {
-        if (*p == '.' && !seen_dot) {
-            seen_dot = true;
-            continue;
-        }
-        if (*p < '0' || *p > '9')
-            return false;
-        any_digit = true;
-        if (!seen_dot) {
-            whole = whole * 10 + (*p - '0');
-        } else if (frac_digits < 8) {
-            frac = frac * 10 + (*p - '0');
-            ++frac_digits;
-        }
-    }
-    if (!any_digit)
-        return false;
-    int64_t scale_left = kScale;
-    for (int i = 0; i < frac_digits; ++i)
-        scale_left /= 10;
-    *out = whole * kScale + frac * scale_left;
-    return true;
-}
 
 // One take-profit or stop-loss leg, resolved from whatever unit the trader typed it into.
 // The panel computes this once per frame and uses the same struct for the preview line and
@@ -230,48 +186,6 @@ void format_usd_plain(Usd value, char* out, size_t cap) noexcept {
                   static_cast<long long>(cents));
 }
 
-// Where the limits below live, so a blocked ticket can point at the file to edit rather than
-// leaving the trader to guess whether the venue or parsec refused the order.
-constexpr const char* kConfigPathHint = "~/.parsec/config.json (\"limits\")";
-
-// Maps a risk::check_order failure onto the config key that governs it. Returns nullptr for
-// checks that are not user-tunable (the kill switch and the rate budget are venue/safety state,
-// not settings).
-const char* local_limit_setting(const char* check) noexcept {
-    if (std::strcmp(check, "max order notional") == 0)
-        return "max_order_notional_usd";
-    if (std::strcmp(check, "max position notional") == 0)
-        return "max_position_notional_usd";
-    if (std::strcmp(check, "minimum notional") == 0)
-        return "min_notional_usd";
-    if (std::strcmp(check, "max leverage") == 0)
-        return "max_leverage";
-    if (std::strcmp(check, "mark price band") == 0)
-        return "max_price_band_bps";
-    return nullptr;
-}
-
-Usd local_limit_value(const char* check, const risk::Limits& limits) noexcept {
-    if (std::strcmp(check, "max order notional") == 0)
-        return limits.max_order_notional;
-    if (std::strcmp(check, "max position notional") == 0)
-        return limits.max_position_notional;
-    if (std::strcmp(check, "minimum notional") == 0)
-        return limits.min_notional;
-    if (std::strcmp(check, "mark price band") == 0)
-        return static_cast<Usd>(limits.max_price_band_bps) * (kScale / 10'000);
-    return 0;
-}
-
-Usd positive_usd(Usd value) noexcept {
-    return value < 0 ? -value : value;
-}
-
-Usd maintenance_for_value(Usd position_value, Usd maintenance_rate_1e8) noexcept {
-    return static_cast<Usd>(static_cast<__int128>(positive_usd(position_value)) *
-                            maintenance_rate_1e8 / kScale);
-}
-
 Px blended_entry(Px old_entry, Qty old_size, Px new_entry, Qty new_size) noexcept {
     const __int128 old_abs = old_size < 0 ? -static_cast<__int128>(old_size) : old_size;
     const __int128 new_abs = new_size < 0 ? -static_cast<__int128>(new_size) : new_size;
@@ -286,6 +200,11 @@ Px blended_entry(Px old_entry, Qty old_size, Px new_entry, Qty new_size) noexcep
 }  // namespace
 
 void draw_ticket(PanelContext& ctx) {
+    // Idempotent within a frame (see ui_event_store.hpp): whichever panel draws first pops the
+    // ring, the rest are no-ops. Called here so the ticket never renders a frame behind the
+    // venue rejection it is supposed to be showing.
+    event_store().drain(ctx.bridge);
+
     if (!ImGui::Begin(kWindowTicket)) {
         ImGui::End();
         return;
@@ -499,34 +418,11 @@ void draw_ticket(PanelContext& ctx) {
                                                     : ctx.portfolio.asset_data.max_trade_sell)
                           : 0;
 
-    // The venue's cap is not the only one. risk::check_order also refuses an order over
-    // `max_order_notional`, or one that would push this asset's position over
-    // `max_position_notional` -- both local settings the ticket enforces itself. Folding them
-    // into the slider is what makes "100%" mean "the largest order this ticket will actually
-    // send", instead of handing the trader a size and then blocking it, which is exactly what
-    // it used to do. Priced at `entry_ref` because that is the price the risk gate values the
-    // order at, not the mark the venue's own cap is denominated in.
-    const Usd existing_notional = current_position
-                                      ? positive_usd(current_position->value.position_value)
-                                      : 0;
-    const Usd position_room = ctx.limits.max_position_notional > existing_notional
-                                  ? ctx.limits.max_position_notional - existing_notional
-                                  : 0;
-    const Usd risk_cap_value = std::min(ctx.limits.max_order_notional, position_room);
-    // `risk_cap_known` and not `risk_cap_qty > 0`: a cap of exactly zero (the position is
-    // already at max_position_notional) is a real answer, and must clamp the slider to zero
-    // rather than being read as "unknown" and ignored.
-    const bool risk_cap_known = entry_ref > 0;
-    const Qty risk_cap_qty =
-        risk_cap_known ? portfolio::qty_from_notional(risk_cap_value, entry_ref) : 0;
-    // The venue's cap stays the sizing BASIS -- the risk limits only clamp it -- so a missing
-    // activeAssetData response still falls through to the withdrawable-cash path below instead
-    // of sizing off a limit that knows nothing about the account's margin.
-    Qty slider_max_qty = venue_max_qty;
-    if (risk_cap_known && slider_max_qty > risk_cap_qty)
-        slider_max_qty = risk_cap_qty;
-    const bool risk_cap_binds =
-        risk_cap_known && venue_max_qty > 0 && risk_cap_qty < venue_max_qty;
+    // The venue's `maxTradeSzs` is the only ceiling there is: it already folds in free margin,
+    // the selected leverage, the existing position and the margin mode, and Hyperliquid
+    // rejects anything past it with a reason that reaches the toast line below. There is no
+    // second local cap to reconcile it with.
+    const Qty slider_max_qty = venue_max_qty;
 
     // Hidden label so the trailing text can say WHICH max without changing the widget's ImGui
     // ID mid-drag: "100%" of a locally-capped max is not 100% of the account's buying power,
@@ -543,11 +439,7 @@ void draw_ticket(PanelContext& ctx) {
             const __int128 budget = static_cast<__int128>(ctx.portfolio.account.withdrawable) *
                                     ctx.view.ticket_leverage * pct / 100;
             const __int128 sz128 = budget * kScale / sizing_ref;
-            Qty fallback = sz128 > 0 ? static_cast<Qty>(sz128) : 0;
-            if (risk_cap_known)
-                fallback = std::min(fallback, static_cast<Qty>(
-                                                  static_cast<__int128>(risk_cap_qty) * pct / 100));
-            ctx.view.ticket_sz = fallback;
+            ctx.view.ticket_sz = sz128 > 0 ? static_cast<Qty>(sz128) : 0;
         } else {
             // A valid zero budget is authoritative; never replace it with account-level
             // withdrawable cash while the venue is telling us this side cannot open.
@@ -556,7 +448,7 @@ void draw_ticket(PanelContext& ctx) {
         refresh_size_buf();
     }
     ImGui::SameLine();
-    ImGui::TextUnformatted(risk_cap_binds ? "% of max (risk limit)" : "% of max");
+    ImGui::TextUnformatted("% of max");
 
     // --- Rounding preview: "what you see is what gets signed" (docs/02 §7) ---
     const exec::AssetPrecision precision{ctx.sz_decimals};
@@ -827,8 +719,7 @@ void draw_ticket(PanelContext& ctx) {
             ? (ctx.view.ticket_is_buy ? ctx.portfolio.asset_data.avail_buy
                                       : ctx.portfolio.asset_data.avail_sell)
             : 0;
-    // The venue's own side-specific ceiling, kept separate from `slider_max_qty` (which also
-    // folds in the local risk limits) because only this one is what the venue would reject on.
+    // The venue's own side-specific ceiling -- what Hyperliquid would reject on.
     const Qty max_trade_qty =
         data_for_asset
             ? (ctx.view.ticket_is_buy ? ctx.portfolio.asset_data.max_trade_buy
@@ -875,14 +766,15 @@ void draw_ticket(PanelContext& ctx) {
         if (ctx.view.ticket_cross) {
             const Usd current_maintenance =
                 current_position && current_position->value.is_cross
-                    ? maintenance_for_value(current_position->value.position_value,
-                                             maintenance_rate)
+                    ? portfolio::maintenance_margin(current_position->value.position_value,
+                                                    maintenance_rate)
                     : 0;
             const Usd other_maintenance =
                 std::max<Usd>(0, ctx.portfolio.account.cross_maintenance_margin -
                                      current_maintenance);
             const Usd total_maintenance =
-                other_maintenance + maintenance_for_value(resulting_value, maintenance_rate);
+                other_maintenance +
+                portfolio::maintenance_margin(resulting_value, maintenance_rate);
             margin_available = ctx.portfolio.account.account_value - total_maintenance;
         } else {
             Usd isolated_margin = 0;
@@ -904,7 +796,8 @@ void draw_ticket(PanelContext& ctx) {
                                                              ctx.view.ticket_leverage);
             }
             margin_available =
-                isolated_margin - maintenance_for_value(resulting_value, maintenance_rate);
+                isolated_margin -
+                portfolio::maintenance_margin(resulting_value, maintenance_rate);
         }
 
         if (margin_available >= 0) {
@@ -924,9 +817,13 @@ void draw_ticket(PanelContext& ctx) {
         ImGui::TableSetupColumn("ticket_summary_value", ImGuiTableColumnFlags_WidthStretch,
                                 0.38F);
 
-        auto summary_usd = [&](const char* label, Usd value, ImVec4 color = kColorTextPrimary) {
+        auto summary_usd = [&](const char* label, Usd value, ImVec4 color = kColorTextPrimary,
+                               bool fine = false) {
             char value_buf[48];
-            format_usd(value, value_buf, sizeof(value_buf));
+            if (fine)
+                format_usd_fine(value, value_buf, sizeof(value_buf));
+            else
+                format_usd(value, value_buf, sizeof(value_buf));
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::TextDisabled("%s", label);
@@ -940,8 +837,10 @@ void draw_ticket(PanelContext& ctx) {
         std::snprintf(fee_label, sizeof(fee_label), "Est. fee (%s)",
                       fee_is_taker ? "taker" : "maker");
         if (fee_ready) {
+            // Fine precision: on a small order the fee is a fraction of a cent, and rounding
+            // it to "$0.00" reads as "this trade is free" rather than "too small to show".
             summary_usd(fee_label, estimated_fee,
-                        estimated_fee <= 0 ? kColorBid : kColorTextPrimary);
+                        estimated_fee <= 0 ? kColorBid : kColorTextPrimary, /*fine=*/true);
         } else {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
@@ -971,11 +870,7 @@ void draw_ticket(PanelContext& ctx) {
         }
 
         if (slider_max_qty > 0) {
-            // The same effective cap the % slider offers: whichever of the venue's
-            // `maxTradeSzs` and the local notional limits binds first. Showing the venue's
-            // number alone made "100% of max" look submittable when the local risk gate was
-            // about to refuse it.
-            const Px max_price = risk_cap_binds && entry_ref > 0 ? entry_ref : available_mark;
+            const Px max_price = available_mark;
             char max_qty_buf[32], max_usd_buf[32], max_buf[96];
             format_qty(slider_max_qty, ctx.sz_decimals, max_qty_buf, sizeof(max_qty_buf));
             format_usd(max_price > 0 ? notional(max_price, slider_max_qty) : 0, max_usd_buf,
@@ -986,10 +881,7 @@ void draw_ticket(PanelContext& ctx) {
             ImGui::TableNextColumn();
             // Notional, i.e. already multiplied by the selected leverage -- which is why it can
             // legitimately be many times the available margin on the line above.
-            if (risk_cap_binds)
-                ImGui::TextDisabled("Max order (risk limit)");
-            else
-                ImGui::TextDisabled("Max order (at %ux)", ctx.view.ticket_leverage);
+            ImGui::TextDisabled("Max order (at %ux)", ctx.view.ticket_leverage);
             ImGui::TableNextColumn();
             ImGui::TextColored(kColorTextPrimary, "%s", max_buf);
         }
@@ -1025,69 +917,6 @@ void draw_ticket(PanelContext& ctx) {
                            "Stop %s is past the %sliquidation price %s -- you are liquidated "
                            "before the stop can trigger",
                            sl_disp, liquidation_is_estimate ? "estimated " : "", liq_disp);
-    }
-
-    // --- Pre-trade risk gate (docs/02 §6.5) ---
-    risk::OrderIntent intent{};
-    intent.px = final_px;
-    intent.qty = final_sz;
-    intent.leverage = ctx.view.ticket_leverage;
-
-    risk::RiskContext risk_ctx{};
-    risk_ctx.mark = ctx.instrument.ctx.mark_px();
-    risk_ctx.existing_position_notional =
-        current_position ? current_position->value.position_value : 0;
-    // kill_switch_armed and rate_budget_bps are engine-side gates and are re-checked by the
-    // engine immediately before signing. The ticket keeps its local preview permissive here;
-    // the status bar exposes the authoritative safety snapshot.
-    risk_ctx.kill_switch_armed = false;
-    risk_ctx.rate_budget_bps = 10'000;
-
-    // The user's CONFIGURED limits, not risk::Limits{}. This gate is the only one a
-    // UI-submitted order passes -- Engine::drain_ui_commands() calls pc_place_order directly
-    // and never re-runs risk::check_order -- so default-constructing them here (as this panel
-    // used to) meant ~/.parsec/config.json was silently ignored for every order placed from
-    // the ticket, and every trader hit the built-in $25,000 ceiling regardless.
-    const risk::CheckOutcome outcome = have_price
-                                           ? risk::check_order(intent, risk_ctx, ctx.limits)
-                                           : risk::CheckOutcome::fail("no price");
-
-    if (!outcome.ok) {
-        char excess_disp[32];
-        // risk::check_order reports `excess` as a magnitude in both directions: for the
-        // minimum-notional check the order is *below* the limit by that much, so "over by"
-        // would name the wrong direction (docs/07 Phase 4).
-        const bool is_shortfall = std::strcmp(outcome.check, "minimum notional") == 0;
-        const char* direction = is_shortfall ? "short by" : "over by";
-        if (outcome.unit == risk::LimitUnit::Usd) {
-            format_usd(outcome.excess, excess_disp, sizeof(excess_disp));
-            ImGui::TextColored(kColorAsk, "Blocked: %s (%s %s)", outcome.check, direction,
-                               excess_disp);
-        } else if (outcome.unit == risk::LimitUnit::Bps) {
-            format_pct(outcome.excess * (kScale / 10'000), 2, excess_disp, sizeof(excess_disp));
-            ImGui::TextColored(kColorAsk, "Blocked: %s (%s %s)", outcome.check, direction,
-                               excess_disp);
-        } else {
-            ImGui::TextColored(kColorAsk, "Blocked: %s", outcome.check);
-        }
-        // Which knob to turn. These rejections are the ticket's own risk config, not the
-        // venue's -- without naming the setting, "max order notional" looks like an exchange
-        // rule the trader cannot do anything about, when in fact the account had ample margin.
-        const char* setting = local_limit_setting(outcome.check);
-        if (setting != nullptr) {
-            char limit_disp[48];
-            if (std::strcmp(outcome.check, "max leverage") == 0) {
-                std::snprintf(limit_disp, sizeof(limit_disp), "%ux", ctx.limits.max_leverage);
-            } else if (std::strcmp(outcome.check, "mark price band") == 0) {
-                format_pct(local_limit_value(outcome.check, ctx.limits), 2, limit_disp,
-                           sizeof(limit_disp));
-            } else {
-                format_usd(local_limit_value(outcome.check, ctx.limits), limit_disp,
-                           sizeof(limit_disp));
-            }
-            ImGui::TextDisabled("local risk limit: %s -- change \"%s\" in %s", limit_disp,
-                                setting, kConfigPathHint);
-        }
     }
 
     const bool account_blocked = !ctx.portfolio.account_valid;
@@ -1127,8 +956,12 @@ void draw_ticket(PanelContext& ctx) {
                            (tp_leg.present && !tp_leg.valid) ? "take profit" : "stop loss");
     }
 
+    // Everything that stops a submit is now either a missing input or the venue's own
+    // arithmetic (margin, max trade size). There is no local notional/leverage/price-band
+    // gate: Hyperliquid enforces its rules on every order and its rejection surfaces on the
+    // note line under the button.
     const bool submit_blocked =
-        !have_price || final_sz <= 0 || !outcome.ok || account_blocked || account_data_loading ||
+        !have_price || final_sz <= 0 || account_blocked || account_data_loading ||
         available_blocked || max_trade_blocked || tpsl_blocked;
 
     ImGui::Separator();
@@ -1212,6 +1045,27 @@ void draw_ticket(PanelContext& ctx) {
     }
     ImGui::PopStyleColor();
     ImGui::EndDisabled();
+
+    // Mirror any new warning/error toast into the note area. Placed after the submit handler so
+    // a rejection that arrives in the same frame as a click wins over the "Sent" line -- the
+    // failure is the more important of the two, and the order of events is what it says.
+    const uint64_t pushed = event_store().toasts_pushed();
+    const uint64_t have = event_store().toast_count();
+    if (pushed > g_prefs.seen_toasts) {
+        // Only the toasts still resident in the ring can be read back; anything older than that
+        // was displaced while this panel was not looking and is simply skipped.
+        const uint64_t first = pushed - have > g_prefs.seen_toasts ? pushed - have
+                                                                   : g_prefs.seen_toasts;
+        for (uint64_t n = first; n < pushed; ++n) {
+            const ToastRow& t = event_store().toast_at(static_cast<size_t>(n - (pushed - have)));
+            if (t.severity == 0)
+                continue;  // info; the "Sent" line already covers the only one this panel emits
+            std::snprintf(g_prefs.submit_note, sizeof(g_prefs.submit_note), "%s", t.text);
+            g_prefs.submit_note_error = true;
+            g_prefs.submit_note_ms = ctx.now_ms;
+        }
+    }
+    g_prefs.seen_toasts = pushed;
 
     // "Sent" is an acknowledgement that the order left this panel, not that the venue accepted
     // it -- the ack, the fill and any rejection all arrive later and belong to Open Orders and

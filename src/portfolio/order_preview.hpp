@@ -53,6 +53,16 @@ inline Usd maintenance_rate_for_max_leverage(uint32_t max_leverage) noexcept {
     return static_cast<Usd>(static_cast<uint64_t>(kScale) / denominator);
 }
 
+// The maintenance margin a position of `position_value` notional requires at
+// `maintenance_rate_1e8` (see maintenance_rate_for_max_leverage above). Sign-agnostic: a
+// short's notional is exactly as much exposure as a long's, and the venue's requirement does
+// not care which way the position points.
+inline Usd maintenance_margin(Usd position_value, Usd maintenance_rate_1e8) noexcept {
+    const __int128 value = position_value < 0 ? -static_cast<__int128>(position_value)
+                                              : static_cast<__int128>(position_value);
+    return static_cast<Usd>(value * maintenance_rate_1e8 / kScale);
+}
+
 // Scales a move of the coin's price into the move the POSITION sees. `pct_1e8` is a
 // kScale-scaled signed fraction of the entry price; the position moves `leverage` times as far,
 // because the margin behind it is only order_value / leverage while the PnL is order_value *

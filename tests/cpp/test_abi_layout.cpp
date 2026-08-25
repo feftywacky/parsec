@@ -38,7 +38,9 @@ static_assert(sizeof(pc_candle) == 64);
 static_assert(sizeof(pc_asset_ctx) == 56);
 static_assert(sizeof(pc_asset_data) == 48);
 static_assert(sizeof(pc_fee_rates) == 16);
-static_assert(sizeof(pc_order_update) == 64);
+static_assert(sizeof(pc_order_update) == 72);
+static_assert(offsetof(pc_order_update, trigger_px) == 56,
+              "trigger_px must sit after orig_sz, before the flag bytes");
 static_assert(sizeof(pc_fill) == 72);
 static_assert(sizeof(pc_position) == 72);
 static_assert(sizeof(pc_account) == 40);
@@ -75,6 +77,6 @@ TEST_CASE("FFI struct layout matches the frozen ABI in include/parsec/parsec.h")
     // Everything meaningful is asserted at compile time above; reaching this line means the
     // C++ view of the ABI is intact. The Rust view is checked by `abi_layout` in
     // rust/src/ffi/types.rs, and both must pass for the two halves to agree.
-    CHECK(PC_ABI_VERSION == 1u);
+    CHECK(PC_ABI_VERSION == 3u);
     CHECK(pc_abi_version() == PC_ABI_VERSION);
 }

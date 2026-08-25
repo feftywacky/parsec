@@ -37,6 +37,27 @@ const char* format_usd(Usd value, char* out, size_t cap) noexcept;
 // Formats a raw 1e8-scaled fraction (e.g. AssetCtx::funding_rate_1e8, or a computed 24h-change
 // fraction) as a percentage with `decimals` places and a trailing '%', e.g. 1e8-scaled 12500
 // (== 0.000125 == 0.0125%) at decimals=4 -> "0.0125%".
+// Same as format_usd, but keeps small amounts legible instead of rounding them into "$0.00".
+// A taker fee on a $10 order is around half a cent, and two decimal places report that as
+// nothing at all -- which reads as "no fee was charged" rather than "the fee is smaller than
+// this column shows". Values under $1 print with 6 decimals, everything else with 2, so the
+// column still lines up for the amounts that dominate it.
+const char* format_usd_fine(Usd value, char* out, size_t cap) noexcept;
+
 const char* format_pct(int64_t value_1e8, int decimals, char* out, size_t cap) noexcept;
+
+// Formats a unix-millisecond timestamp as "M/D/YYYY - HH:MM:SS" in the viewer's LOCAL time.
+// Local, not UTC, unlike the chart's time axis: an axis is read against other axes and market
+// sessions, while a history row is read against the trader's own memory of when they did the
+// thing. Writes "--" for a zero timestamp, which is what an event that carried no venue clock
+// gets. Not thread-safe assumptions: uses localtime_r, so it is reentrant.
+const char* format_time_ms(uint64_t unix_ms, char* out, size_t cap) noexcept;
+
+// The inverse of the above, for text fields: parses a plain decimal string like "118342.5"
+// into a kScale-scaled integer. Returns false (leaving *out untouched) on anything that is not
+// a plain non-negative decimal, so a typo is never silently accepted as zero -- which on a
+// price or size field is the difference between a rejected order and a wrong one. Digits past
+// the 8th decimal place are truncated, matching the fixed-point grid the value lands on.
+[[nodiscard]] bool parse_fixed(const char* text, int64_t* out) noexcept;
 
 }  // namespace pc::ui

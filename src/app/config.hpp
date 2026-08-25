@@ -1,12 +1,9 @@
 #pragma once
-// Configuration layer (docs/07 Phase 3 file list, docs/02 §6.5: "all [risk limits] are config
-// values"). Loaded once at startup from ~/.parsec/config.json. A missing or malformed file must
+// Configuration layer (docs/07 Phase 3 file list). Loaded once at startup from ~/.parsec/config.json. A missing or malformed file must
 // never prevent parsec from starting in read-only market-data mode -- load() always returns a
 // usable Config, falling back field-by-field to defaults() rather than failing the whole parse.
 #include <cstdint>
 #include <string>
-
-#include "risk/pre_trade.hpp"
 
 namespace pc::app {
 
@@ -20,9 +17,6 @@ struct Config {
     // 0x-prefixed hex, informational only (display + keystore header verification). Never a
     // secret -- the master key itself is never stored anywhere (docs/06 §2).
     std::string master_address;
-
-    // -- risk limits (docs/02 §6.5) --
-    risk::Limits limits{};
 
     // -- timers --
     uint64_t order_ack_timeout_ms{5'000};

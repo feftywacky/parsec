@@ -363,14 +363,46 @@ pub(crate) async fn fetch_open_orders(
                 px: parse_scaled(&o.limit_px).unwrap_or(0),
                 sz: parse_scaled(&o.sz).unwrap_or(0),
                 orig_sz: parse_scaled(&o.orig_sz).unwrap_or(0),
+                trigger_px: if o.is_trigger {
+                    parse_scaled(&o.trigger_px).unwrap_or(0)
+                } else {
+                    0
+                },
                 is_buy: (o.side == "B") as u8,
                 reduce_only: o.reduce_only as u8,
+                is_trigger: o.is_trigger as u8,
+                tpsl: tpsl_kind(o.is_trigger, &o.order_type),
+                // The venue names it in the order type: "Take Profit Market" converts to a
+                // market order when it fires, "Take Profit Limit" to a limit one.
+                is_market_trigger: o.order_type.ends_with("Market") as u8,
             },
         };
         events.push(event);
     }
     if n == 0 {
-        events.push(PcEvent::error(0, "no open orders", req_id));
+        // An empty result is a snapshot too: "nothing is resting" has to reach the consumer as
+        // a bracketed batch, or a UI that rebuilds its list from these events can never learn
+        // that the last resting order is gone. `oid == 0` is the empty marker -- a real order
+        // always has one.
+        let mut event = base_event(PC_EV_ORDER_UPDATE, PC_ASSET_NONE, 0, req_id);
+        event.flags = PC_F_SNAPSHOT | PC_F_SNAPSHOT_BEGIN | PC_F_SNAPSHOT_END;
+        event.u = PcEventUnion {
+            order_update: PcOrderUpdate {
+                oid: 0,
+                cloid: [0; 16],
+                status: PC_ORD_UNKNOWN,
+                px: 0,
+                sz: 0,
+                orig_sz: 0,
+                trigger_px: 0,
+                is_buy: 0,
+                reduce_only: 0,
+                is_trigger: 0,
+                tpsl: PC_TPSL_NONE,
+                is_market_trigger: 0,
+            },
+        };
+        events.push(event);
     }
     Ok(())
 }
@@ -410,6 +442,42 @@ async fn fetch_user_fills(
 /// the WS `userFills` stream, which is the same shape) -> a `PC_EV_FILL` event. No I/O
 /// — shared by the REST fetch above and `transport::user_ws`'s reconnect
 /// reconciliation (`fetch_user_fills_since`) and its live `userFills` stream.
+/// Maps a `frontendOpenOrders` / `historicalOrders` `orderType` string onto `PC_TPSL_*`.
+/// The venue names the leg in the order type ("Take Profit Market", "Stop Limit", ...);
+/// there is no separate boolean, so this is the only place the two legs are told apart.
+fn tpsl_kind(is_trigger: bool, order_type: &str) -> u8 {
+    if !is_trigger {
+        return PC_TPSL_NONE;
+    }
+    if order_type.contains("Take Profit") {
+        PC_TPSL_TP
+    } else {
+        PC_TPSL_SL
+    }
+}
+
+/// Maps the venue's `userFills.dir` string onto `PC_DIR_*`. The string is the only place the
+/// wire says whether a fill opened, closed or flipped a position -- the side alone cannot,
+/// since a sell is an opening short or a closing long depending on what was held.
+fn dir_code(dir: &str) -> u8 {
+    match dir {
+        "Open Long" => PC_DIR_OPEN_LONG,
+        "Close Long" => PC_DIR_CLOSE_LONG,
+        "Open Short" => PC_DIR_OPEN_SHORT,
+        "Close Short" => PC_DIR_CLOSE_SHORT,
+        "Long > Short" => PC_DIR_LONG_TO_SHORT,
+        "Short > Long" => PC_DIR_SHORT_TO_LONG,
+        "Buy" => PC_DIR_BUY,
+        "Sell" => PC_DIR_SELL,
+        // "Liquidated Cross", "Liquidated Isolated", "Auto-Deleveraged ..." and any future
+        // wording all mean the same thing to a reader of a history table.
+        other if other.starts_with("Liquidated") || other.starts_with("Auto-Deleveraged") => {
+            PC_DIR_LIQUIDATION
+        }
+        _ => PC_DIR_UNKNOWN,
+    }
+}
+
 pub(crate) fn fill_event(
     registry: &SharedRegistry,
     req_id: u64,
@@ -432,6 +500,7 @@ pub(crate) fn fill_event(
             closed_pnl: parse_scaled(&f.closed_pnl).unwrap_or(0),
             is_buy: (f.side == "B") as u8,
             is_taker: f.crossed as u8,
+            dir: dir_code(&f.dir),
         },
     };
     event
@@ -546,7 +615,10 @@ async fn fetch_historical_orders(
         let o = &entry.order;
         let asset = registry.index_of(&o.coin);
         let mut event = base_event(PC_EV_ORDER_UPDATE, asset, entry.status_timestamp, req_id);
-        let mut flags = PC_F_SNAPSHOT;
+        // Marks the whole batch as an order's PAST. `frontendOpenOrders` below emits the same
+        // event kind for what is resting NOW; without this bit a consumer cannot tell the two
+        // apart, and a history backfill repopulates the open-orders list with dead orders.
+        let mut flags = PC_F_SNAPSHOT | PC_F_HISTORICAL;
         if i == 0 {
             flags |= PC_F_SNAPSHOT_BEGIN;
         }
@@ -562,8 +634,18 @@ async fn fetch_historical_orders(
                 px: parse_scaled(&o.limit_px).unwrap_or(0),
                 sz: parse_scaled(&o.sz).unwrap_or(0),
                 orig_sz: parse_scaled(&o.orig_sz).unwrap_or(0),
+                trigger_px: if o.is_trigger {
+                    parse_scaled(&o.trigger_px).unwrap_or(0)
+                } else {
+                    0
+                },
                 is_buy: (o.side == "B") as u8,
                 reduce_only: o.reduce_only as u8,
+                is_trigger: o.is_trigger as u8,
+                tpsl: tpsl_kind(o.is_trigger, &o.order_type),
+                // The venue names it in the order type: "Take Profit Market" converts to a
+                // market order when it fires, "Take Profit Limit" to a limit one.
+                is_market_trigger: o.order_type.ends_with("Market") as u8,
             },
         };
         events.push(event);
@@ -660,4 +742,38 @@ async fn fetch_user_rate_limit(
     };
     events.push(event);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dir_code_covers_every_direction_the_venue_reports() {
+        assert_eq!(dir_code("Open Long"), PC_DIR_OPEN_LONG);
+        assert_eq!(dir_code("Close Long"), PC_DIR_CLOSE_LONG);
+        assert_eq!(dir_code("Open Short"), PC_DIR_OPEN_SHORT);
+        assert_eq!(dir_code("Close Short"), PC_DIR_CLOSE_SHORT);
+        assert_eq!(dir_code("Long > Short"), PC_DIR_LONG_TO_SHORT);
+        assert_eq!(dir_code("Short > Long"), PC_DIR_SHORT_TO_LONG);
+        // Every liquidation wording collapses to one code -- the distinction between cross,
+        // isolated and auto-deleveraged matters to the venue, not to a history row.
+        assert_eq!(dir_code("Liquidated Cross"), PC_DIR_LIQUIDATION);
+        assert_eq!(dir_code("Liquidated Isolated"), PC_DIR_LIQUIDATION);
+        assert_eq!(dir_code("Auto-Deleveraged Long"), PC_DIR_LIQUIDATION);
+        // Anything unrecognised must fall back rather than be silently mapped onto a
+        // direction it does not mean; the UI then renders the side instead.
+        assert_eq!(dir_code("Something New"), PC_DIR_UNKNOWN);
+    }
+
+    #[test]
+    fn order_type_names_the_trigger_leg_and_whether_it_is_market() {
+        assert_eq!(tpsl_kind(false, "Limit"), PC_TPSL_NONE);
+        assert_eq!(tpsl_kind(true, "Take Profit Market"), PC_TPSL_TP);
+        assert_eq!(tpsl_kind(true, "Stop Market"), PC_TPSL_SL);
+        assert_eq!(tpsl_kind(true, "Stop Limit"), PC_TPSL_SL);
+        // is_market_trigger is read straight off the same string in order_wire's callers.
+        assert!("Take Profit Market".ends_with("Market"));
+        assert!(!"Take Profit Limit".ends_with("Market"));
+    }
 }

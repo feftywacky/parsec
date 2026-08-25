@@ -54,6 +54,113 @@ int64_t day_change_1e8(Px mark, Px prev_day) noexcept {
 
 }  // namespace
 
+void draw_menu_bar_status(PanelContext& ctx) {
+    // Network first and unabbreviated. This is a safety control (docs/06 §2): the one place
+    // that says out loud whether an order placed from this window spends real money, so it
+    // never gets shortened to a colour or an icon.
+    const bool live = ctx.instrument.valid() && (ctx.instrument.bbo.has_execution_bid() ||
+                                                 ctx.instrument.bbo.has_execution_ask());
+    ImGui::TextColored(ctx.mainnet ? kColorTextPrimary : kColorWarning, "hyperliquid %s",
+                       ctx.mainnet ? "mainnet" : "testnet");
+    ImGui::SameLine(0.0F, 8.0F);
+    ImGui::TextColored(live ? kColorBid : kColorWarning, live ? "\xe2\x97\x8f live"
+                                                              : "\xe2\x97\x8b connecting");
+
+    if (!ctx.instrument.valid())
+        return;
+
+    app::SafetySnapshot safety{};
+    ctx.bridge.load_safety(safety);
+
+    // Feed latency, one column per order-book subscription. All three feed the same ladder
+    // (md/book_merge.hpp), and their cadences differ by two orders of magnitude, so a single
+    // averaged number would hide exactly the difference that matters: `deep` is the
+    // deep-but-slow default l2Book, `fast` the 5-level l2Book, `bbo` the top-of-book stream
+    // that actually sets how quickly the touch moves. Each shows rolling cadence and age since
+    // the last message, and turns amber when its staleness signal fires.
+    const auto& st = ctx.instrument.staleness;
+    ImGui::SameLine(0.0F, 24.0F);
+    ImGui::BeginGroup();
+    // Round-trip latency first: it is the one number here that is a true network figure, and
+    // the cadences beside it are meaningless without it. A quote is already ~rtt/2 old the
+    // instant it lands, since the venue's push travels one way.
+    const float rtt_ms = static_cast<float>(safety.market_rtt_us) / 1000.0F;
+    const float user_rtt_ms = static_cast<float>(safety.user_rtt_us) / 1000.0F;
+    if (safety.market_rtt_us == 0)
+        ImGui::TextColored(kColorTextMuted, "mkt --");
+    else
+        ImGui::TextColored(rtt_ms > 250.0F ? kColorWarning : kColorTextPrimary, "mkt %.0fms",
+                           static_cast<double>(rtt_ms));
+    ImGui::SameLine();
+    // The user socket carries fills and order acks, so its round trip -- not the market
+    // socket's -- is what an order actually pays on the way back.
+    if (safety.user_rtt_us == 0)
+        ImGui::TextColored(kColorTextMuted, "usr --");
+    else
+        ImGui::TextColored(user_rtt_ms > 250.0F ? kColorWarning : kColorTextPrimary, "usr %.0fms",
+                           static_cast<double>(user_rtt_ms));
+    ImGui::SameLine();
+    ImGui::TextColored(st.bbo_signals != 0 ? kColorWarning : kColorTextPrimary, "| bbo %u/%ums",
+                       st.bbo_cadence_ms, st.bbo_age_ms);
+    ImGui::SameLine();
+    ImGui::TextColored(kColorTextMuted, "fast %u/%ums", st.l2_fast_cadence_ms, st.l2_fast_age_ms);
+    ImGui::SameLine();
+    ImGui::TextColored(st.l2_signals != 0 ? kColorWarning : kColorTextMuted, "deep %u/%ums",
+                       st.l2_cadence_ms, st.l2_age_ms);
+    ImGui::EndGroup();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "VENUE -- WebSocket ping/pong round trip, the only true network figures here.\n"
+            "mkt:  market socket (l2Book/bbo/assetCtx). Market data travels ONE way, so a\n"
+            "      quote arrives about mkt/2 old.\n"
+            "usr:  user socket (fills, order acks). An order round trip (send -> ack)\n"
+            "      costs the full usr rtt.\n\n"
+            "The rest are push CADENCES: how often the venue sends, not transit time.\n"
+            "bbo:  1 level,   ~86ms on mainnet BTC -- sets the ladder's touch.\n"
+            "fast: 5 levels,  ~530ms  (l2Book fast:true).\n"
+            "deep: 20 levels, ~5.4s   (default l2Book) -- fills the tail only.\n"
+            "The ladder composes all three, so the touch is not gated on the slow feed.");
+
+    // --- Local latency: what this process costs, kept visually separate from the venue
+    // figures above so a slow tick is never read as a slow venue. ---
+    ImGui::SameLine(0.0F, 24.0F);
+    ImGui::BeginGroup();
+    const float tick_ms = static_cast<float>(safety.engine_tick_us) / 1000.0F;
+    const float tick_max_ms = static_cast<float>(safety.engine_tick_max_us) / 1000.0F;
+    ImGui::TextColored(safety.engine_tick_max_us > 5'000 ? kColorWarning : kColorTextPrimary,
+                       "tick %.2f/%.2fms", static_cast<double>(tick_ms),
+                       static_cast<double>(tick_max_ms));
+    ImGui::SameLine();
+    if (safety.engine_cmd_us == 0)
+        ImGui::TextColored(kColorTextMuted, "| cmd --");
+    else
+        ImGui::TextColored(safety.engine_cmd_us > 5'000 ? kColorWarning : kColorTextMuted,
+                           "| cmd %.2fms", static_cast<double>(safety.engine_cmd_us) / 1000.0);
+    ImGui::SameLine();
+    // Snapshot age: how stale everything on screen is relative to the engine's own state.
+    // Published on the engine's monotonic clock, which is the same clock this reads.
+    const uint64_t now_ns = monotonic_ns();
+    const double snap_age_ms = safety.publish_mono_ns != 0 && now_ns > safety.publish_mono_ns
+                                   ? static_cast<double>(now_ns - safety.publish_mono_ns) / 1e6
+                                   : 0.0;
+    ImGui::TextColored(snap_age_ms > 100.0 ? kColorWarning : kColorTextMuted, "| age %.1fms",
+                       snap_age_ms);
+    ImGui::SameLine();
+    ImGui::TextColored(kColorTextMuted, "| batch %u", safety.engine_batch_events);
+    ImGui::EndGroup();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "LOCAL -- this process, not the network. Nothing here crosses the internet.\n"
+            "tick: one engine loop's work (apply events -> UI commands -> timers ->\n"
+            "      publish), shown as EWMA / worst case since the last publish. The\n"
+            "      pc_poll wait is excluded -- blocking on an idle socket is not work.\n"
+            "cmd:  how long a UI command (order, leverage, subscription) waited in the\n"
+            "      SPSC ring before the engine picked it up. The local half of an\n"
+            "      order's send latency; the venue half is the usr rtt on the left.\n"
+            "age:  how old this snapshot is -- engine state -> your screen.\n"
+            "batch: events applied in the last non-empty poll; high means busy, not slow.");
+}
+
 void draw_instruments(PanelContext& ctx) {
     if (ImGui::Begin(kWindowInstruments)) {
         if (ctx.universe.count == 0) {
@@ -164,101 +271,6 @@ void draw_instruments(PanelContext& ctx) {
         ImGui::TextColored(funding_s <= 60 ? kColorWarning : kColorTextPrimary, "%02u:%02u:%02u",
                            funding_s / 3600U, (funding_s / 60U) % 60U, funding_s % 60U);
         ImGui::EndGroup();
-
-        // Feed latency, one column per order-book subscription. All three feed the same
-        // ladder (md/book_merge.hpp), and their cadences differ by two orders of magnitude, so
-        // a single averaged number would hide exactly the difference that matters: `book` is
-        // the deep-but-slow default l2Book, `fast` the 5-level l2Book, `bbo` the top-of-book
-        // stream that actually sets how quickly the touch moves. Each shows rolling cadence
-        // and age since the last message, and turns amber when its staleness signal fires.
-        const auto& st = ctx.instrument.staleness;
-        ImGui::SameLine(0.0F, 28.0F);
-        ImGui::BeginGroup();
-        // Round-trip latency first: it is the one number here that is a true network figure,
-        // and the cadences beside it are meaningless without it. A quote is already ~rtt/2 old
-        // the instant it lands, since the venue's push travels one way.
-        app::SafetySnapshot safety{};
-        ctx.bridge.load_safety(safety);
-        const float rtt_ms = static_cast<float>(safety.market_rtt_us) / 1000.0F;
-        const float user_rtt_ms = static_cast<float>(safety.user_rtt_us) / 1000.0F;
-        ImGui::TextColored(kColorTextMuted, "Venue RTT / feeds (cadence / age)");
-        if (safety.market_rtt_us == 0)
-            ImGui::TextColored(kColorTextMuted, "mkt --");
-        else
-            ImGui::TextColored(rtt_ms > 250.0F ? kColorWarning : kColorTextPrimary, "mkt %.0fms",
-                               static_cast<double>(rtt_ms));
-        ImGui::SameLine();
-        // The user socket carries fills and order acks, so its round trip -- not the market
-        // socket's -- is what an order actually pays on the way back.
-        if (safety.user_rtt_us == 0)
-            ImGui::TextColored(kColorTextMuted, "usr --");
-        else
-            ImGui::TextColored(user_rtt_ms > 250.0F ? kColorWarning : kColorTextPrimary,
-                               "usr %.0fms", static_cast<double>(user_rtt_ms));
-        ImGui::SameLine();
-        ImGui::TextColored(st.bbo_signals != 0 ? kColorWarning : kColorTextPrimary,
-                           "| bbo %u/%ums", st.bbo_cadence_ms, st.bbo_age_ms);
-        ImGui::SameLine();
-        ImGui::TextColored(kColorTextMuted, "fast %u/%ums", st.l2_fast_cadence_ms,
-                           st.l2_fast_age_ms);
-        ImGui::SameLine();
-        ImGui::TextColored(st.l2_signals != 0 ? kColorWarning : kColorTextMuted, "deep %u/%ums",
-                           st.l2_cadence_ms, st.l2_age_ms);
-        ImGui::EndGroup();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "VENUE -- WebSocket ping/pong round trip, the only true network figures here.\n"
-                "mkt:  market socket (l2Book/bbo/assetCtx). Market data travels ONE way, so a\n"
-                "      quote arrives about mkt/2 old.\n"
-                "usr:  user socket (fills, order acks). An order round trip (send -> ack)\n"
-                "      costs the full usr rtt.\n\n"
-                "The rest are push CADENCES: how often the venue sends, not transit time.\n"
-                "bbo:  1 level,   ~86ms on mainnet BTC -- sets the ladder's touch.\n"
-                "fast: 5 levels,  ~530ms  (l2Book fast:true).\n"
-                "deep: 20 levels, ~5.4s   (default l2Book) -- fills the tail only.\n"
-                "The ladder composes all three, so the touch is not gated on the slow feed.");
-
-        // --- Local latency: what this process costs, kept visually separate from the venue
-        // figures above so a slow tick is never read as a slow venue. ---
-        ImGui::SameLine(0.0F, 28.0F);
-        ImGui::BeginGroup();
-        ImGui::TextColored(kColorTextMuted, "Engine (tick / cmd / age)");
-        const float tick_ms = static_cast<float>(safety.engine_tick_us) / 1000.0F;
-        const float tick_max_ms = static_cast<float>(safety.engine_tick_max_us) / 1000.0F;
-        ImGui::TextColored(safety.engine_tick_max_us > 5'000 ? kColorWarning : kColorTextPrimary,
-                           "tick %.2f/%.2fms", static_cast<double>(tick_ms),
-                           static_cast<double>(tick_max_ms));
-        ImGui::SameLine();
-        if (safety.engine_cmd_us == 0)
-            ImGui::TextColored(kColorTextMuted, "| cmd --");
-        else
-            ImGui::TextColored(safety.engine_cmd_us > 5'000 ? kColorWarning : kColorTextMuted,
-                               "| cmd %.2fms",
-                               static_cast<double>(safety.engine_cmd_us) / 1000.0);
-        ImGui::SameLine();
-        // Snapshot age: how stale everything on screen is relative to the engine's own state.
-        // Published on the engine's monotonic clock, which is the same clock this reads.
-        const uint64_t now_ns = monotonic_ns();
-        const double snap_age_ms =
-            safety.publish_mono_ns != 0 && now_ns > safety.publish_mono_ns
-                ? static_cast<double>(now_ns - safety.publish_mono_ns) / 1e6
-                : 0.0;
-        ImGui::TextColored(snap_age_ms > 100.0 ? kColorWarning : kColorTextMuted, "| age %.1fms",
-                           snap_age_ms);
-        ImGui::SameLine();
-        ImGui::TextColored(kColorTextMuted, "| batch %u", safety.engine_batch_events);
-        ImGui::EndGroup();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(
-                "LOCAL -- this process, not the network. Nothing here crosses the internet.\n"
-                "tick: one engine loop's work (apply events -> UI commands -> timers ->\n"
-                "      publish), shown as EWMA / worst case since the last publish. The\n"
-                "      pc_poll wait is excluded -- blocking on an idle socket is not work.\n"
-                "cmd:  how long a UI command (order, leverage, subscription) waited in the\n"
-                "      SPSC ring before the engine picked it up. The local half of an\n"
-                "      order's send latency; the venue half is the usr rtt on the left.\n"
-                "age:  how old this snapshot is -- engine state -> your screen.\n"
-                "batch: events applied in the last non-empty poll; high means busy, not slow.");
 
         // docs/09-measurements.md §2.1-2.2: funding/OI/volume/mark/oracle were observed
         // parsing as zero on testnet earlier in development, due to a decimal-precision bug

@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <cstring>
 #include <string_view>
 
 #include "core/units.hpp"
@@ -10,90 +11,6 @@
 
 using namespace pc;
 using namespace pc::risk;
-
-TEST_CASE("pre_trade: kill switch rejects unconditionally and names itself") {
-    OrderIntent intent{100 * kScale, kScale, 1};
-    RiskContext ctx{};
-    ctx.kill_switch_armed = true;
-    const auto out = check_order(intent, ctx, Limits{});
-    CHECK_FALSE(out.ok);
-    CHECK(std::string_view(out.check) == "kill switch armed");
-}
-
-TEST_CASE("pre_trade: minimum notional names the check and the exact shortfall") {
-    OrderIntent intent{5 * kScale, kScale, 1};  // $5 notional, below the $10 floor
-    RiskContext ctx{};
-    const auto out = check_order(intent, ctx, Limits{});
-    CHECK_FALSE(out.ok);
-    CHECK(std::string_view(out.check) == "minimum notional");
-    CHECK(out.unit == LimitUnit::Usd);
-    CHECK(out.excess == 5 * kScale);
-}
-
-TEST_CASE("pre_trade: max order notional names the check and the exact excess") {
-    Limits limits{};
-    limits.max_order_notional = 1'000 * kScale;
-    OrderIntent intent{2'000 * kScale, kScale, 1};  // $2000 notional
-    RiskContext ctx{};
-    const auto out = check_order(intent, ctx, limits);
-    CHECK_FALSE(out.ok);
-    CHECK(std::string_view(out.check) == "max order notional");
-    CHECK(out.unit == LimitUnit::Usd);
-    CHECK(out.excess == 1'000 * kScale);
-}
-
-TEST_CASE("pre_trade: max position notional accounts for the existing position") {
-    Limits limits{};
-    limits.max_position_notional = 1'000 * kScale;
-    OrderIntent intent{100 * kScale, kScale, 1};  // $100 more
-    RiskContext ctx{};
-    ctx.existing_position_notional = 950 * kScale;  // already $950 -> $1050 total
-    const auto out = check_order(intent, ctx, limits);
-    CHECK_FALSE(out.ok);
-    CHECK(std::string_view(out.check) == "max position notional");
-    CHECK(out.excess == 50 * kScale);
-}
-
-TEST_CASE("pre_trade: max leverage is named in bps") {
-    Limits limits{};
-    limits.max_leverage = 10;
-    OrderIntent intent{100 * kScale, kScale, 20};
-    RiskContext ctx{};
-    const auto out = check_order(intent, ctx, limits);
-    CHECK_FALSE(out.ok);
-    CHECK(std::string_view(out.check) == "max leverage");
-    CHECK(out.unit == LimitUnit::Bps);
-}
-
-TEST_CASE("pre_trade: price band vs mark is named in bps") {
-    Limits limits{};
-    limits.max_price_band_bps = 1'000;            // 10%
-    OrderIntent intent{130 * kScale, kScale, 1};  // 30% above mark
-    RiskContext ctx{};
-    ctx.mark = 100 * kScale;
-    const auto out = check_order(intent, ctx, limits);
-    CHECK_FALSE(out.ok);
-    CHECK(std::string_view(out.check) == "mark price band");
-    CHECK(out.unit == LimitUnit::Bps);
-    CHECK(out.excess == 2'000);  // 30% - 10% = 20% = 2000bps over
-}
-
-TEST_CASE("pre_trade: rate budget below 10% rejects new orders") {
-    OrderIntent intent{100 * kScale, kScale, 1};
-    RiskContext ctx{};
-    ctx.rate_budget_bps = 500;  // 5%
-    const auto out = check_order(intent, ctx, Limits{});
-    CHECK_FALSE(out.ok);
-    CHECK(std::string_view(out.check) == "rate budget");
-}
-
-TEST_CASE("pre_trade: a well-formed order within every limit passes") {
-    OrderIntent intent{100 * kScale, kScale, 5};
-    RiskContext ctx{};
-    ctx.mark = 100 * kScale;
-    const auto out = check_order(intent, ctx, Limits{});
-    CHECK(out.ok);
-}
 
 TEST_CASE("RateBudget: no data yet is optimistic, does not block") {
     RateBudget rb;
@@ -165,4 +82,31 @@ TEST_CASE("DeadMansSwitch: the budget resets on the next UTC day") {
     const uint64_t next_day = DeadMansSwitch::kMsPerUtcDay + 1;
     CHECK(dms.trigger_now(next_day, &deadline));  // fresh day, fresh budget
     CHECK(dms.triggers_remaining_today(next_day) == DeadMansSwitch::kMaxTriggersPerUtcDay - 1);
+}
+
+
+TEST_CASE("order gate passes when no client-side condition blocks trading") {
+    // No notional, leverage or price-band opinion lives here any more: the venue owns those.
+    CHECK(check_order(RiskContext{}).ok);
+}
+
+TEST_CASE("order gate refuses while the kill switch is armed") {
+    RiskContext ctx{};
+    ctx.kill_switch_armed = true;
+    const auto out = check_order(ctx);
+    CHECK_FALSE(out.ok);
+    CHECK(std::strcmp(out.check, "kill switch armed") == 0);
+}
+
+TEST_CASE("order gate refuses when the address action budget is nearly spent") {
+    RiskContext ctx{};
+    ctx.rate_budget_bps = 400;  // 4% left, under the 10% floor
+    const auto out = check_order(ctx);
+    CHECK_FALSE(out.ok);
+    CHECK(std::strcmp(out.check, "rate budget") == 0);
+    CHECK(out.unit == LimitUnit::Bps);
+    CHECK(out.excess == 600);
+
+    ctx.rate_budget_bps = 1'000;  // exactly at the floor is still allowed
+    CHECK(check_order(ctx).ok);
 }

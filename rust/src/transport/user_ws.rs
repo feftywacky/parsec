@@ -309,8 +309,16 @@ fn parse_event(
                         px,
                         sz,
                         orig_sz,
+                        // `orderUpdates` carries neither the trigger price nor the leg
+                        // (docs/03 §W2.7). A resting trigger order gets both from the
+                        // `frontendOpenOrders` snapshot the reconciler re-pulls every few
+                        // seconds; a zero here means "unknown", not "not a trigger".
+                        trigger_px: 0,
                         is_buy: (side == "B") as u8,
                         reduce_only: 0, // not present on this payload (docs/03 §W2.7).
+                        is_trigger: 0,
+                        tpsl: PC_TPSL_NONE,
+                        is_market_trigger: 0,
                     },
                 };
                 events.push(event);

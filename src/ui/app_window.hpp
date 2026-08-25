@@ -21,8 +21,8 @@ inline constexpr const char* kWindowTicket = "Ticket";
 inline constexpr const char* kWindowPositions = "Positions";
 inline constexpr const char* kWindowOpenOrders = "Open Orders";
 inline constexpr const char* kWindowBalances = "Balances";
-inline constexpr const char* kWindowFills = "Fills";
-inline constexpr const char* kWindowFunding = "Funding";
+inline constexpr const char* kWindowFills = "Trade History";
+inline constexpr const char* kWindowFunding = "Funding History";
 inline constexpr const char* kWindowOrderHistory = "Order History";
 inline constexpr const char* kWindowStatus = "Status";
 

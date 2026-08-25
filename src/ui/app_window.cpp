@@ -258,36 +258,8 @@ int AppWindow::run() {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        const ImGuiViewport* viewport = ImGui::GetMainViewport();
-        ImGui::SetNextWindowPos(viewport->WorkPos);
-        ImGui::SetNextWindowSize(viewport->WorkSize);
-        ImGui::SetNextWindowViewport(viewport->ID);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0F);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0F);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0F, 0.0F));
-        constexpr ImGuiWindowFlags kHostFlags =
-            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
-            ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_MenuBar;
-        ImGui::Begin("ParsecDockSpaceHost", nullptr, kHostFlags);
-        ImGui::PopStyleVar(3);
-
-        if (ImGui::BeginMenuBar()) {
-            const bool live =
-                instrument.asset != PC_ASSET_NONE &&
-                (instrument.bbo.has_execution_bid() || instrument.bbo.has_execution_ask());
-            ImGui::TextDisabled("%s live", live ? "market" : "connecting");
-            ImGui::EndMenuBar();
-        }
-
-        const ImGuiID dockspace_id = ImGui::GetID("ParsecDockSpace");
-        if (!layout_built_) {
-            build_default_layout(dockspace_id);
-            layout_built_ = true;
-        }
-        ImGui::DockSpace(dockspace_id, ImVec2(0.0F, 0.0F), ImGuiDockNodeFlags_None);
-        ImGui::End();
-
+        // Built before the host window so the menu bar -- which now carries the network badge
+        // and the latency strip -- can read the same frame's snapshots as the panels do.
         const uint32_t active = engine_.active_asset();
         view_.active_asset = active;
         engine_.bridge().load_universe(universe);
@@ -307,8 +279,35 @@ int AppWindow::run() {
                          view_,
                          unix_ms(),
                          sz_decimals,
-                         engine_.mainnet(),
-                         engine_.limits()};
+                         engine_.mainnet()};
+
+        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(viewport->WorkPos);
+        ImGui::SetNextWindowSize(viewport->WorkSize);
+        ImGui::SetNextWindowViewport(viewport->ID);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0F);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0F);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0F, 0.0F));
+        constexpr ImGuiWindowFlags kHostFlags =
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus |
+            ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_MenuBar;
+        ImGui::Begin("ParsecDockSpaceHost", nullptr, kHostFlags);
+        ImGui::PopStyleVar(3);
+
+        if (ImGui::BeginMenuBar()) {
+            draw_menu_bar_status(ctx);
+            ImGui::EndMenuBar();
+        }
+
+        const ImGuiID dockspace_id = ImGui::GetID("ParsecDockSpace");
+        if (!layout_built_) {
+            build_default_layout(dockspace_id);
+            layout_built_ = true;
+        }
+        ImGui::DockSpace(dockspace_id, ImVec2(0.0F, 0.0F), ImGuiDockNodeFlags_None);
+        ImGui::End();
+
         draw_panels(ctx);
 
         // Drawn last so it lands on top of the docked panels. PC_AUTH_NO_KEYSTORE means no
