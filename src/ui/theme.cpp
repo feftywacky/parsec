@@ -17,6 +17,7 @@ void apply_theme() {
     style.WindowPadding = ImVec2(8.0F, 8.0F);
     style.FramePadding = ImVec2(6.0F, 4.0F);
     style.ItemSpacing = ImVec2(6.0F, 4.0F);
+    style.DockingSeparatorSize = 6.0F;
 
     // Interaction feedback is a translucent overlay on the single ground rather than a
     // lighter surface colour, so "no other background shades" survives hover/active states.

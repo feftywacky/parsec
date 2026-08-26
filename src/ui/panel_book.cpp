@@ -19,7 +19,7 @@ namespace {
 // Ladder depth per side. A fixed row count (rather than "however many levels the feed sent")
 // is what makes this read as a ladder: the spread sits at a stable screen position and rows
 // stay put frame to frame, so the eye tracks size changes instead of re-finding the touch.
-constexpr int kDisplayLevels = 12;
+constexpr int kDisplayLevels = 11;
 static_assert(kDisplayLevels <= PC_MAX_LEVELS);
 
 // --- price-interval aggregation ---------------------------------------------------------
