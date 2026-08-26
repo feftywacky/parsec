@@ -163,8 +163,7 @@ int AppWindow::run() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 #endif
 
-    const char* window_title =
-        engine_.mainnet() ? "Parsec — Hyperliquid mainnet" : "Parsec — Hyperliquid testnet";
+    const char* window_title = "Parsec";
     window_ = glfwCreateWindow(1280, 800, window_title, nullptr, nullptr);
     if (window_ == nullptr) {
         glfwTerminate();

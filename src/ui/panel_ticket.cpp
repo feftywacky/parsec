@@ -708,17 +708,20 @@ void draw_ticket(PanelContext& ctx) {
     const Px available_mark = data_for_asset && ctx.portfolio.asset_data.mark > 0
                                   ? ctx.portfolio.asset_data.mark
                                   : ctx.instrument.ctx.mark_px();
-    // activeAssetData's `availableToTrade` is MARGIN in USDC, not a notional -- the venue's own
-    // response makes that unambiguous: at 3x leverage its `maxTradeSzs * markPx` comes out at
-    // exactly 3x `availableToTrade` (docs/03 §W8 #6). Treating it as a notional (as this panel
-    // previously did) both mis-sized the % slider and printed a meaningless coin quantity
-    // beside it, computed as margin/mark. So: availableToTrade is compared against the order's
-    // *margin requirement*, and the base-quantity capacity comes from `maxTradeSzs`.
+    // Deliberately NOT activeAssetData's `availableToTrade`. That field is `maxTradeSzs * mark
+    // / leverage` -- the venue divides the whole side capacity by leverage, including the part
+    // of the capacity that merely CLOSES an existing position. Closing consumes no margin (it
+    // releases margin), so dividing it by leverage yields a number that is not any real
+    // quantity of margin: on a 0.75 BTC short at 10x it reported $12.7k of "available margin"
+    // against an account worth $6.8k. Free margin is an account-level fact, so it comes from
+    // the account snapshot and does not depend on the ticket's side.
+    // Free collateral -- the USDC not backing a position, which is what can fund a new one.
+    // Same basis as the Balances tab (see panel_balances.cpp for why this is `withdrawable`
+    // and not `account_value - total_margin_used`, which goes negative on ordinary adverse
+    // moves and is not a quantity of anything). It also nets out margin locked by resting
+    // orders, which `total_margin_used` -- positions only -- does not.
     const Usd available_margin =
-        data_for_asset
-            ? (ctx.view.ticket_is_buy ? ctx.portfolio.asset_data.avail_buy
-                                      : ctx.portfolio.asset_data.avail_sell)
-            : 0;
+        ctx.portfolio.account_valid ? std::max<Usd>(0, ctx.portfolio.account.withdrawable) : 0;
     // The venue's own side-specific ceiling -- what Hyperliquid would reject on.
     const Qty max_trade_qty =
         data_for_asset
@@ -748,10 +751,30 @@ void draw_ticket(PanelContext& ctx) {
             preview_entry = current_position->value.entry_px;
     }
 
-    const Usd margin_required = ctx.view.ticket_reduce_only
-                                    ? 0
-                                    : portfolio::initial_margin(order_value,
-                                                                 ctx.view.ticket_leverage);
+    // The margin this order actually costs, which is the margin on the position it LEAVES
+    // BEHIND minus the margin already posted against the position it trades through -- not the
+    // full order notional over leverage. Buying 1.6 BTC against a 0.75 BTC short does not need
+    // $12.7k: it flattens the short (freeing its $5.9k) and leaves a 0.86 BTC long, so its real
+    // cost is the ~$0.9k difference. Charging the full notional made the old "Margin required"
+    // line agree with the equally inflated `availableToTrade` above -- two wrong numbers whose
+    // ratio happened to be right, so the gate passed while both displayed figures were fiction.
+    Usd margin_required = 0;
+    if (!ctx.view.ticket_reduce_only && final_sz > 0) {
+        const Qty resulting_abs = resulting_szi < 0 ? -resulting_szi : resulting_szi;
+        const Px margin_px = available_mark > 0 ? available_mark : final_px;
+        const Usd resulting_margin = portfolio::initial_margin(
+            notional(margin_px, resulting_abs), ctx.view.ticket_leverage);
+        // Only margin in the same mode is fungible with the free margin above: an isolated
+        // position's margin is not part of the cross pool, so releasing it does not fund a
+        // cross order. When the modes disagree, charge the order in full rather than promise
+        // an offset the venue will not give.
+        const Usd released =
+            current_position && existing_szi != 0 &&
+                    (current_position->value.is_cross != 0) == ctx.view.ticket_cross
+                ? current_position->value.margin_used
+                : 0;
+        margin_required = std::max<Usd>(0, resulting_margin - released);
+    }
     const Usd maintenance_rate =
         portfolio::maintenance_rate_for_max_leverage(max_leverage);
     Px liquidation_px = resulting_szi != 0 && current_position && current_position->value.liq_px > 0
@@ -851,12 +874,12 @@ void draw_ticket(PanelContext& ctx) {
 
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
-        // Margin, so it is printed as USDC and nothing else. The pre-fix version divided it by
-        // the mark and printed the result as a coin size, which read like a tradeable quantity
-        // but was margin-per-unit-price -- off by the leverage factor from anything real.
+        // Account-level and side-independent, matching the Balances tab exactly. "Margin
+        // required" above is already net of the margin this order releases, so the two lines
+        // compare directly: required <= available is the whole solvency question.
         ImGui::TextDisabled("Available margin");
         ImGui::TableNextColumn();
-        if (data_for_asset) {
+        if (ctx.portfolio.account_valid) {
             char usd_buf[32];
             format_usd(available_margin, usd_buf, sizeof(usd_buf));
             ImGui::TextColored(available_margin > 0 ? kColorTextPrimary : kColorWarning,
@@ -880,8 +903,18 @@ void draw_ticket(PanelContext& ctx) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             // Notional, i.e. already multiplied by the selected leverage -- which is why it can
-            // legitimately be many times the available margin on the line above.
-            ImGui::TextDisabled("Max order (at %ux)", ctx.view.ticket_leverage);
+            // legitimately be many times the available margin on the line above. On the side
+            // opposing an open position `maxTradeSzs` also covers flattening it, so it dwarfs
+            // free margin; "+close" says so. The label column is narrow, so this stays terse
+            // rather than clipping -- the tooltip carries the full sentence.
+            const bool max_includes_close =
+                existing_szi != 0 && (existing_szi > 0) != ctx.view.ticket_is_buy;
+            ImGui::TextDisabled("Max %s %ux%s", ctx.view.ticket_is_buy ? "buy" : "sell",
+                                ctx.view.ticket_leverage,
+                                max_includes_close ? " +close" : "");
+            if (max_includes_close && ImGui::IsItemHovered())
+                ImGui::SetTooltip("Includes closing the open position: this size flattens it "
+                                  "and opens the other way with the margin that frees up.");
             ImGui::TableNextColumn();
             ImGui::TextColored(kColorTextPrimary, "%s", max_buf);
         }
@@ -922,11 +955,14 @@ void draw_ticket(PanelContext& ctx) {
     const bool account_blocked = !ctx.portfolio.account_valid;
     const bool account_data_loading = ctx.portfolio.account_valid && !data_for_asset &&
                                       !ctx.view.ticket_reduce_only;
-    // Margin against margin. Comparing the order's full *notional* against availableToTrade
-    // (as before) blocked every order above 1x, since availableToTrade is the margin behind
-    // the position rather than the position's value.
-    const bool available_blocked = data_for_asset && !ctx.view.ticket_reduce_only &&
-                                   have_price && margin_required > available_margin;
+    // Net new margin against free margin -- both account-level and in the same units.
+    //
+    // `margin_required > 0` keeps an order that needs no new margin -- one that only reduces or
+    // flattens -- from ever being blocked on margin. It cannot be the thing that makes the
+    // account unsafe, and it is the way out of a fully-committed account.
+    const bool available_blocked = ctx.portfolio.account_valid && !ctx.view.ticket_reduce_only &&
+                                   have_price && margin_required > 0 &&
+                                   margin_required > available_margin;
     const bool max_trade_blocked = data_for_asset && !ctx.view.ticket_reduce_only &&
                                    max_trade_qty > 0 && final_sz > max_trade_qty;
     if (account_blocked) {

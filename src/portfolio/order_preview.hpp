@@ -31,9 +31,11 @@ inline Usd fee_estimate(Usd order_value, int64_t rate_1e8) noexcept {
 // Convert a USDC notional budget into base-asset quantity -- used by the ticket's USD-
 // denominated size entry.
 //
-// NB: the venue's `availableToTrade` is NOT a notional; it is the free MARGIN in USDC, which
-// is why `maxTradeSzs * markPx` comes out at `availableToTrade * leverage` in Hyperliquid's
-// own activeAssetData examples (docs/03 §W8 #6). Pass a notional here, not availableToTrade.
+// NB: the venue's `availableToTrade` is NOT a notional -- `maxTradeSzs * markPx` comes out at
+// `availableToTrade * leverage` in Hyperliquid's own activeAssetData examples (docs/03 §W8 #6).
+// It is not free margin either: it is that whole side capacity divided by leverage, and the
+// capacity includes closing an existing position, which releases margin rather than spending
+// it. So on an open position it overstates spendable margin. Pass a real notional here.
 inline Qty qty_from_notional(Usd value, Px price) noexcept {
     if (value <= 0 || price <= 0)
         return 0;
