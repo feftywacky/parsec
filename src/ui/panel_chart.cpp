@@ -358,14 +358,18 @@ void draw_chart(PanelContext& ctx) {
             const ImVec2 plot_size = ImPlot::GetPlotSize();
             ImDrawList* overlay_dl = ImPlot::GetPlotDrawList();
 
-            const Px live_px = ctx.instrument.ctx.mark_px() > 0 ? ctx.instrument.ctx.mark_px()
-                                                                : g_candle_buf[n - 1].c;
+            // The newest bar's close, NOT the mark. Two different prices live on this screen:
+            // the mark is an oracle-blended index (activeAssetCtx, ~1 msg/s) while the candles
+            // plot traded prints, so a mark-sourced line is drawn in a coordinate the bars do
+            // not share and floats off the last bar by however far the two happen to disagree.
+            // The close is the last print by definition, so the line always touches its bar --
+            // and it is live rather than lagging, because md::MarketStore now folds every trade
+            // into the in-progress bar at every timeframe.
+            const Px live_px = g_candle_buf[n - 1].c > 0 ? g_candle_buf[n - 1].c
+                                                         : ctx.instrument.ctx.mark_px();
             bool price_tag_drawn = false;
             LevelTag price_tag{};
             if (live_px > 0) {
-                // The live mark (activeAssetCtx, ~1 msg/s) rather than the newest candle's
-                // close: the candle only moves when a trade prints, so on a quiet minute its
-                // close is visibly behind the price the ticket is about to trade at.
                 char label[32];
                 format_px(live_px, ctx.sz_decimals, label, sizeof(label));
                 const bool up = g_candle_buf[n - 1].c >= g_candle_buf[n - 1].o;

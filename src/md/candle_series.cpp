@@ -49,6 +49,12 @@ void CandleSeries::fold_trade(Px px, Qty sz, uint64_t time_ms, uint64_t interval
     if (interval_ms == 0)
         return;
     const uint64_t open_ms = time_ms - (time_ms % interval_ms);
+    // A print older than the newest bar (out-of-order tape, or a trade that lands while a
+    // backfill is still being stitched in) must not append: the series is kept strictly
+    // ascending, and appending behind the head would corrupt that ordering for every reader.
+    // Dropping it is right rather than merely safe -- the bar it belongs to is already closed.
+    if (size_ && open_ms < at(size_ - 1).open_ms)
+        return;
 
     generation_.fetch_add(1, std::memory_order_acq_rel);  // -> odd: write in progress
     std::atomic_signal_fence(std::memory_order_acq_rel);

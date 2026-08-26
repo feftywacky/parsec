@@ -49,12 +49,19 @@ void MarketStore::apply(const pc_event& e) noexcept {
             break;
         case PC_EV_TRADE:
             a.trades.apply(e.u.trade);
-            // The venue serves no candles below 1m, so the sub-minute timeframes are folded
-            // from this same print (see CandleSeries::fold_trade). Doing it for every
-            // sub-minute series on every trade -- rather than only the one the chart happens
-            // to be showing -- is what lets switching between 1s and 30s be instant instead of
+            // Every timeframe is folded from this same print, not just the sub-minute ones.
+            //
+            // Below 1m it is the only source -- the venue serves no such candles. At 1m and
+            // above the venue's `candle` push is authoritative but arrives on its own cadence,
+            // so between pushes the in-progress bar's close sits behind the tape; the chart's
+            // live-price line then floats off the last bar it is supposed to be touching.
+            // Folding keeps that bar's c/h/l/v current on every print, and the next PC_EV_CANDLE
+            // overwrites it wholesale (CandleSeries::apply) so the venue still has the last word.
+            //
+            // Doing it for every series on every trade -- rather than only the one the chart
+            // happens to be showing -- is what lets switching timeframes be instant instead of
             // starting each series from scratch at the moment it is first viewed.
-            for (uint8_t iv = 0; iv < PC_IV_FIRST_VENUE; ++iv)
+            for (uint8_t iv = 0; iv < kIntervalCount; ++iv)
                 a.candles[iv].fold_trade(e.u.trade.px, e.u.trade.sz, e.u.trade.time_ms,
                                          kIntervalMs[iv], iv);
             break;

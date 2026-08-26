@@ -428,6 +428,27 @@ void draw_positions(PanelContext& ctx) {
     }
     const RealizedRow& realized_total = event_store().realized_total();
 
+    // Funding belongs in the session realized total, not beside it. It is settled cash: the
+    // venue moves it hourly against the margin balance, closing the position does not give it
+    // back, and no mark-to-market can undo it -- which is the definition of realized. Left out,
+    // the summary answers "what did my entries and exits earn" while appearing to answer "what
+    // have I actually made", and cannot reconcile against account value, where
+    //     account = deposits + trading P&L + funding + unrealized.
+    //
+    // The two components do NOT cover identical windows, and pretending otherwise would make
+    // this number quietly wrong: `userFills` backfills the venue's most recent fills with no
+    // time bound, while `userFunding` backfills a fixed 30 days (rust/src/ffi/fetch.rs). Both
+    // then run forward on the live stream, and both deduplicate replays (by trade id / by
+    // (asset, hour)), so neither double-counts -- but the funding leg can reach back further
+    // than the trading leg on a quiet account, or less far on a busy one. That is a real limit
+    // of what the venue serves, not something this panel can reconcile, so the tooltip states
+    // both windows rather than the strip implying a single clean one.
+    //
+    // The per-position Funding COLUMN is a third figure again -- the venue's
+    // cumFunding.allTime for that one position -- and must not be substituted here.
+    const Usd funding_total = event_store().funding_total();
+    const Usd session_realized = realized_total.pnl + funding_total;
+
     char buf[48];
     // The strip ends in a full-height "Close All" button, so every text run before it is
     // aligned to frame padding -- otherwise the numbers ride above the button's baseline.
@@ -437,18 +458,43 @@ void draw_positions(PanelContext& ctx) {
     format_usd(total_unrealized, buf, sizeof(buf));
     ImGui::TextColored(total_unrealized >= 0 ? kColorBid : kColorAsk, "%s", buf);
     ImGui::SameLine();
-    ImGui::TextDisabled("|  Realized (session)");
+    ImGui::TextDisabled("|  Realized");
     ImGui::SameLine();
-    format_usd_fine(realized_total.pnl, buf, sizeof(buf));
-    ImGui::TextColored(realized_total.pnl >= 0 ? kColorBid : kColorAsk, "%s", buf);
+    format_usd_fine(session_realized, buf, sizeof(buf));
+    ImGui::TextColored(session_realized >= 0 ? kColorBid : kColorAsk, "%s", buf);
     if (ImGui::IsItemHovered()) {
-        char fees[32];
-        format_usd_fine(realized_total.fees, fees, sizeof(fees));
+        // Broken out rather than shown as one number: the total says how much money moved,
+        // the split says whether it moved because of trade selection or because of carry,
+        // and those call for completely different responses.
+        char closed[32], fees[32], funding[32];
+        format_usd_fine(realized_total.pnl + realized_total.fees, closed, sizeof(closed));
+        format_usd_fine(-realized_total.fees, fees, sizeof(fees));
+        format_usd_fine(funding_total, funding, sizeof(funding));
         ImGui::SetTooltip(
-            "Net of fees, over the %u fills this session has seen (live stream plus the\n"
-            "venue's reconnect backfill) -- not the account's lifetime history.\n"
-            "Fees paid over those fills: %s",
-            realized_total.fills, fees);
+            "Cash actually settled -- everything except open marks.\n\n"
+            "  closed P&L   %s   (over %u fills)\n"
+            "  fees         %s\n"
+            "  funding      %s\n"
+            "  ---------------------------\n"
+            "  total        %s\n\n"
+            "Funding is included because it is settled cash: the venue moves it hourly\n"
+            "against your margin, and closing the position does not give it back.\n\n"
+            "The two legs cover different windows, which is a limit of what the venue\n"
+            "serves: fills backfill the most recent ones with no time bound, funding\n"
+            "backfills a fixed 30 days. Both run forward live from there.\n\n"
+            "The per-position Funding column is a THIRD figure -- cumFunding.allTime for\n"
+            "that one position -- so it will not tie out against the funding line here.",
+            closed, realized_total.fills, fees, funding, buf);
+    }
+    // The funding component, spelled out on the strip rather than left to a hover. Fusing it
+    // into the total is right (it is settled cash) but it made the total unverifiable at a
+    // glance: there is no way to tell a total that includes funding from one that forgot to,
+    // and "is my funding in there?" is exactly the question this number has to answer.
+    if (funding_total != 0) {
+        ImGui::SameLine(0.0F, 6.0F);
+        char funding_buf[32];
+        format_usd_fine(funding_total, funding_buf, sizeof(funding_buf));
+        ImGui::TextDisabled("(incl. funding %s)", funding_buf);
     }
     ImGui::SameLine();
     ImGui::TextDisabled("|  Margin used");
@@ -601,8 +647,19 @@ void draw_positions(PanelContext& ctx) {
                 if (ImGui::IsItemHovered()) {
                     char fees[32];
                     format_usd_fine(realized.fees, fees, sizeof(fees));
-                    ImGui::SetTooltip("Net of %s in fees over %u fills this session.", fees,
-                                      realized.fills);
+                    // Deliberately trading-only, unlike the session total in the strip above,
+                    // which folds funding in. At row level the split is the informative part:
+                    // it separates whether the entry and exit were good from whether the
+                    // position is bleeding on carry, and the Funding column sits right beside
+                    // this one to be read against it. Those two facts call for different
+                    // responses, so the row keeps them apart.
+                    ImGui::SetTooltip(
+                        "Closed P&L net of fees: %s in fees over %u fills this session.\n"
+                        "Only counts size actually closed -- while the position is open this\n"
+                        "is just the fees paid to open it.\n\n"
+                        "Trading only. Funding is the column to the right; the two are added\n"
+                        "together in the Realized (session) total above.",
+                        fees, realized.fills);
                 }
             } else {
                 ImGui::TextDisabled("--");

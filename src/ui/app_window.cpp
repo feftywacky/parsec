@@ -47,15 +47,19 @@ void AppWindow::build_default_layout(unsigned int dockspace_id_in) {
 
     // Top instrument strip. Sized for its actual content: the header strip is two text lines
     // tall (label over value) plus window padding and the dock tab bar, so the 0.06 that fit
-    // the old single-line table clipped the value row off the bottom.
+    // the old single-line table clipped the value row off the bottom. 0.085 fit the text but
+    // left it flush against the Chart tab underneath; the extra height is deliberate breathing
+    // room below the value row, not space for more content.
     ImGuiID top{};
     ImGuiID main{};
-    ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Up, 0.085F, &top, &main);
+    ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Up, 0.095F, &top, &main);
 
-    // Bottom tab group for account/history panels.
+    // Bottom tab group for account/history panels. Sized so the positions table shows several
+    // rows plus its summary line without scrolling -- at 0.28 an account with more than two
+    // positions had to be scrolled to be read, which is the wrong tradeoff against chart height.
     ImGuiID bottom{};
     ImGuiID upper{};
-    ImGui::DockBuilderSplitNode(main, ImGuiDir_Down, 0.28F, &bottom, &upper);
+    ImGui::DockBuilderSplitNode(main, ImGuiDir_Down, 0.22F, &bottom, &upper);
 
     // Ticket on the far right.
     ImGuiID ticket{};
@@ -163,12 +167,34 @@ int AppWindow::run() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 #endif
 
+    // Open filling the screen, but as an ordinary resizable window rather than a real
+    // fullscreen one. Passing a monitor to glfwCreateWindow would take exclusive fullscreen --
+    // its own display mode, no menu bar, and on macOS its own Space -- which is wrong for a
+    // trading terminal that gets tabbed away from constantly. Sizing to the monitor's WORK AREA
+    // instead gives the whole screen minus whatever the OS reserves (menu bar and Dock here,
+    // taskbar/panels elsewhere), so nothing lands underneath a system bar. Falls back to a
+    // fixed size only if the monitor cannot be queried, which is the headless/odd-setup case.
     const char* window_title = "Parsec";
-    window_ = glfwCreateWindow(1280, 800, window_title, nullptr, nullptr);
+    int win_x = 0, win_y = 0, win_w = 1280, win_h = 800;
+    if (GLFWmonitor* monitor = glfwGetPrimaryMonitor()) {
+        int area_x = 0, area_y = 0, area_w = 0, area_h = 0;
+        glfwGetMonitorWorkarea(monitor, &area_x, &area_y, &area_w, &area_h);
+        if (area_w > 0 && area_h > 0) {
+            win_x = area_x;
+            win_y = area_y;
+            win_w = area_w;
+            win_h = area_h;
+        }
+    }
+    window_ = glfwCreateWindow(win_w, win_h, window_title, nullptr, nullptr);
     if (window_ == nullptr) {
         glfwTerminate();
         return 1;
     }
+    // Position explicitly: the window manager places a new window on its own otherwise, which
+    // on a multi-monitor setup routinely lands it half off the primary display.
+    if (win_w != 1280 || win_h != 800)
+        glfwSetWindowPos(window_, win_x, win_y);
     glfwMakeContextCurrent(window_);
     glfwSwapInterval(1);
 

@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cfloat>
 #include <cstdint>
+#include <cstdio>
 
 #include "core/time.hpp"
 #include "core/units.hpp"
@@ -19,6 +20,67 @@ struct InstrumentPrefs {
     bool coin_combo_open{false};
 };
 InstrumentPrefs g_prefs;
+
+// --- Local latency readout: peak-hold ------------------------------------------------------
+//
+// Two problems make the raw engine figures unreadable, and they pull in opposite directions.
+// Shown in milliseconds they are all "0.00" -- the engine loop runs three orders of magnitude
+// below the venue's scale, so every digit rounds away. Shown in microseconds they carry real
+// digits but change every frame, and a number that redraws 60 times a second cannot be read at
+// all; the eye only gets an impression of "some digits".
+//
+// Fixing one without the other is impossible, so both are fixed at once: the unit is ALWAYS
+// microseconds (no per-frame scale switching -- these fields are compared against each other,
+// and a column that silently changes unit cannot be), and the displayed value is latched.
+// Each figure accumulates its PEAK over a 500ms window; at the end of the window the peak
+// becomes the displayed value and the accumulator resets. So the strip updates twice a second,
+// slowly enough to actually read, and what it shows is the worst case in the window rather than
+// whichever sample happened to land on the frame that drew -- which is the number that matters
+// anyway. A spike can no longer flash past between two redraws.
+constexpr uint64_t kLatchWindowNs = 500'000'000;
+
+struct LatchedUs {
+    uint64_t shown{};  // held for the whole window; what gets drawn
+    uint64_t peak{};   // accumulating for the window in progress
+};
+
+struct LocalLatencyLatch {
+    LatchedUs age;
+    LatchedUs tick;
+    LatchedUs tick_max;
+    LatchedUs cmd;
+    uint32_t batch_shown{};
+    uint32_t batch_peak{};
+    uint64_t window_start_ns{};
+};
+LocalLatencyLatch g_latency;
+
+// Peaks are folded on every frame; the swap to `shown` happens only when the window closes.
+void latch_observe(LatchedUs& v, uint64_t sample_us) noexcept {
+    if (sample_us > v.peak)
+        v.peak = sample_us;
+}
+void latch_roll(LatchedUs& v) noexcept {
+    v.shown = v.peak;
+    v.peak = 0;
+}
+
+// Fixed unit, thousands-separated so a six-digit microsecond figure stays scannable. Never
+// switches to ms: see the comment above.
+struct LatencyText {
+    char buf[24]{};
+};
+LatencyText format_us(uint64_t us) noexcept {
+    LatencyText out;
+    if (us < 1000) {
+        std::snprintf(out.buf, sizeof(out.buf), "%lluus", static_cast<unsigned long long>(us));
+    } else {
+        std::snprintf(out.buf, sizeof(out.buf), "%llu,%03lluus",
+                      static_cast<unsigned long long>(us / 1000),
+                      static_cast<unsigned long long>(us % 1000));
+    }
+    return out;
+}
 
 bool contains_coin_name(const char* name, const char* filter) noexcept {
     if (!filter || !*filter)
@@ -110,11 +172,18 @@ void draw_menu_bar_status(PanelContext& ctx) {
     ImGui::EndGroup();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
-            "VENUE -- WebSocket ping/pong round trip, the only true network figures here.\n"
-            "mkt:  market socket (l2Book/bbo/assetCtx). Market data travels ONE way, so a\n"
-            "      quote arrives about mkt/2 old.\n"
-            "usr:  user socket (fills, order acks). An order round trip (send -> ack)\n"
-            "      costs the full usr rtt.\n\n"
+            "VENUE -- WebSocket ping/pong ROUND TRIP, the only true network figures here.\n"
+            "Both are measured the same way (we send a ping, the venue echoes a pong, we\n"
+            "time the loop) because that is the only latency a client can measure at all:\n"
+            "one-way timing would need our clock and the venue's to agree, and they do not.\n"
+            "The two sockets are separate TCP connections, so they are timed separately.\n\n"
+            "mkt:  market socket (l2Book/bbo/assetCtx). Nothing is SENT on this socket --\n"
+            "      we subscribe once and the venue pushes. So a quote only travels the\n"
+            "      venue->us half, and arrives roughly mkt/2 old. The ping is sent purely\n"
+            "      to measure; halving the round trip is how we price the one-way push.\n"
+            "usr:  user socket (fills, order acks). Here the round trip is real work, not\n"
+            "      an estimate: an order goes out and its ack comes back, so placing one\n"
+            "      costs the FULL usr rtt before you know it landed.\n\n"
             "The rest are push CADENCES: how often the venue sends, not transit time.\n"
             "bbo:  1 level,   ~86ms on mainnet BTC -- sets the ladder's touch.\n"
             "fast: 5 levels,  ~530ms  (l2Book fast:true).\n"
@@ -123,42 +192,89 @@ void draw_menu_bar_status(PanelContext& ctx) {
 
     // --- Local latency: what this process costs, kept visually separate from the venue
     // figures above so a slow tick is never read as a slow venue. ---
-    ImGui::SameLine(0.0F, 24.0F);
-    ImGui::BeginGroup();
-    const float tick_ms = static_cast<float>(safety.engine_tick_us) / 1000.0F;
-    const float tick_max_ms = static_cast<float>(safety.engine_tick_max_us) / 1000.0F;
-    ImGui::TextColored(safety.engine_tick_max_us > 5'000 ? kColorWarning : kColorTextPrimary,
-                       "tick %.2f/%.2fms", static_cast<double>(tick_ms),
-                       static_cast<double>(tick_max_ms));
-    ImGui::SameLine();
-    if (safety.engine_cmd_us == 0)
-        ImGui::TextColored(kColorTextMuted, "| cmd --");
-    else
-        ImGui::TextColored(safety.engine_cmd_us > 5'000 ? kColorWarning : kColorTextMuted,
-                           "| cmd %.2fms", static_cast<double>(safety.engine_cmd_us) / 1000.0);
-    ImGui::SameLine();
     // Snapshot age: how stale everything on screen is relative to the engine's own state.
     // Published on the engine's monotonic clock, which is the same clock this reads.
     const uint64_t now_ns = monotonic_ns();
-    const double snap_age_ms = safety.publish_mono_ns != 0 && now_ns > safety.publish_mono_ns
-                                   ? static_cast<double>(now_ns - safety.publish_mono_ns) / 1e6
-                                   : 0.0;
-    ImGui::TextColored(snap_age_ms > 100.0 ? kColorWarning : kColorTextMuted, "| age %.1fms",
-                       snap_age_ms);
+    const uint64_t snap_age_us = safety.publish_mono_ns != 0 && now_ns > safety.publish_mono_ns
+                                     ? (now_ns - safety.publish_mono_ns) / 1000
+                                     : 0;
+
+    // Fold this frame's samples into the window's peaks, then roll the window if it has closed.
+    latch_observe(g_latency.age, snap_age_us);
+    latch_observe(g_latency.tick, safety.engine_tick_us);
+    latch_observe(g_latency.tick_max, safety.engine_tick_max_us);
+    latch_observe(g_latency.cmd, safety.engine_cmd_us);
+    if (safety.engine_batch_events > g_latency.batch_peak)
+        g_latency.batch_peak = safety.engine_batch_events;
+    if (g_latency.window_start_ns == 0)
+        g_latency.window_start_ns = now_ns;
+    if (now_ns - g_latency.window_start_ns >= kLatchWindowNs) {
+        latch_roll(g_latency.age);
+        latch_roll(g_latency.tick);
+        latch_roll(g_latency.tick_max);
+        latch_roll(g_latency.cmd);
+        g_latency.batch_shown = g_latency.batch_peak;
+        g_latency.batch_peak = 0;
+        g_latency.window_start_ns = now_ns;
+    }
+
+    ImGui::SameLine(0.0F, 24.0F);
+    ImGui::BeginGroup();
+
+    // Ordered by what a trader can actually act on. Snapshot age comes first: it is the only
+    // figure here that describes what is on the screen right now rather than what the engine
+    // did some time ago, and it is the one that goes bad first when anything upstream stalls.
+    ImGui::TextColored(g_latency.age.shown > 100'000 ? kColorWarning : kColorTextPrimary,
+                       "age %s", format_us(g_latency.age.shown).buf);
     ImGui::SameLine();
-    ImGui::TextColored(kColorTextMuted, "| batch %u", safety.engine_batch_events);
+
+    // EWMA / worst case. The EWMA alone says the loop is idle-fast, which is never in doubt;
+    // the max is the one that costs a quote, so it drives the warning colour.
+    ImGui::TextColored(g_latency.tick_max.shown > 5'000 ? kColorWarning : kColorTextMuted,
+                       "| tick %s/%s", format_us(g_latency.tick.shown).buf,
+                       format_us(g_latency.tick_max.shown).buf);
+    ImGui::SameLine();
+
+    if (g_latency.cmd.shown == 0)
+        ImGui::TextColored(kColorTextMuted, "| cmd --");
+    else
+        ImGui::TextColored(g_latency.cmd.shown > 5'000 ? kColorWarning : kColorTextMuted,
+                           "| cmd %s", format_us(g_latency.cmd.shown).buf);
+    ImGui::SameLine();
+
+    // Not a latency figure, and kept only because it is the one that makes `tick` readable: a
+    // high tick next to a high batch is a busy engine, next to a low batch it is a slow one.
+    ImGui::TextColored(kColorTextMuted, "| batch %u", g_latency.batch_shown);
+    ImGui::SameLine();
+
+    // The one ring-buffer figure that is a fault rather than a measurement. The engine never
+    // blocks on a full event ring -- it drops and counts (UiBridge::push_event) -- so a nonzero
+    // count is the only evidence that the UI thread fell behind and lost engine events outright.
+    // Sticky for the session by construction, and never muted: this is not a perf curiosity.
+    const uint64_t drops = ctx.bridge.dropped_events();
+    if (drops != 0) {
+        ImGui::TextColored(kColorWarning, "| drop %llu", static_cast<unsigned long long>(drops));
+        ImGui::SameLine();
+    }
+    ImGui::TextColored(kColorTextMuted, "| ring %s", drops == 0 ? "ok" : "LOSS");
     ImGui::EndGroup();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
-            "LOCAL -- this process, not the network. Nothing here crosses the internet.\n"
+            "LOCAL -- this process, not the network. Nothing here crosses the internet.\n\n"
+            "All figures are MICROSECONDS, and each is the PEAK over a 500ms window: the\n"
+            "strip updates twice a second so it can be read, and holds the worst sample in\n"
+            "the window rather than whichever one the drawing frame happened to catch.\n\n"
+            "age:  how old this snapshot is -- engine state -> your screen. The figure that\n"
+            "      describes what you are looking at; warns above 100,000us (100ms).\n"
             "tick: one engine loop's work (apply events -> UI commands -> timers ->\n"
-            "      publish), shown as EWMA / worst case since the last publish. The\n"
-            "      pc_poll wait is excluded -- blocking on an idle socket is not work.\n"
+            "      publish), shown as EWMA / worst case. The pc_poll wait is excluded --\n"
+            "      blocking on an idle socket is not work.\n"
             "cmd:  how long a UI command (order, leverage, subscription) waited in the\n"
             "      SPSC ring before the engine picked it up. The local half of an\n"
             "      order's send latency; the venue half is the usr rtt on the left.\n"
-            "age:  how old this snapshot is -- engine state -> your screen.\n"
-            "batch: events applied in the last non-empty poll; high means busy, not slow.");
+            "batch: events applied in one poll; high means busy, not slow.\n"
+            "ring: engine -> UI event ring. 'ok' until the engine has to drop an event\n"
+            "      because the UI thread fell behind, which is a fault, not a slow frame.");
 }
 
 void draw_instruments(PanelContext& ctx) {
