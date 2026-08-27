@@ -39,6 +39,7 @@ enum {
     PC_EV_L2_BOOK = 1, PC_EV_BBO, PC_EV_TRADE, PC_EV_CANDLE, PC_EV_ASSET_CTX,
     PC_EV_ASSET_DATA, PC_EV_ORDER_UPDATE, PC_EV_FILL, PC_EV_POSITION, PC_EV_ACCOUNT,
     PC_EV_ORDER_ACK, PC_EV_CONN, PC_EV_RATE, PC_EV_ERROR, PC_EV_FUNDING, PC_EV_FEE_RATES,
+    PC_EV_SPOT_BALANCE,
 };
 enum {
     PC_F_SNAPSHOT = 1u << 0, PC_F_SNAPSHOT_BEGIN = 1u << 1,
@@ -95,7 +96,7 @@ enum {
     PC_FETCH_META = 1, PC_FETCH_CLEARINGHOUSE_STATE, PC_FETCH_OPEN_ORDERS,
     PC_FETCH_USER_FILLS, PC_FETCH_USER_FUNDING, PC_FETCH_HISTORICAL_ORDERS,
     PC_FETCH_CANDLE_SNAPSHOT, PC_FETCH_ACTIVE_ASSET_DATA, PC_FETCH_USER_RATE_LIMIT,
-    PC_FETCH_USER_FEES,
+    PC_FETCH_USER_FEES, PC_FETCH_SPOT_STATE,
 };
 
 typedef struct { pc_px px; pc_qty sz; uint32_t n; uint32_t _pad; } pc_level;
@@ -134,7 +135,21 @@ enum {
 };
 typedef struct { uint64_t oid,tid; uint8_t cloid[16]; pc_px px; pc_qty qty; pc_usd fee,closed_pnl; uint8_t is_buy,is_taker,dir; } pc_fill;
 typedef struct { pc_qty szi; pc_px entry_px,liq_px; pc_usd position_value,unrealized_pnl,margin_used,cum_funding; int32_t roe_bps; uint32_t leverage; uint8_t is_cross; } pc_position;
-typedef struct { pc_usd account_value,total_margin_used,total_ntl_pos,withdrawable,cross_maintenance_margin; } pc_account;
+/* `account_value`, `total_margin_used` and `total_ntl_pos` are `marginSummary` -- cross AND
+   isolated. `cross_account_value` is `crossMarginSummary.accountValue`, i.e. the same equity
+   with every isolated position's margin and PnL removed; it is the only one of the two that
+   belongs in a cross-margin liquidation calculation, since isolated equity cannot be pulled in
+   to defend a cross position. `cross_maintenance_margin` is likewise cross-only, so it pairs
+   with `cross_account_value` and NOT with `account_value`. */
+typedef struct { pc_usd account_value,cross_account_value,total_margin_used,total_ntl_pos,withdrawable,cross_maintenance_margin; } pc_account;
+/* The account's USDC spot row (`spotClearinghouseState`). Hyperliquid runs a single USDC
+   collateral pool: `total` is every USDC the account holds anywhere, and the part currently
+   deployed as perp equity is counted inside it, so `total` is NOT separate money from
+   `pc_account::account_value` -- it CONTAINS it. `hold` is what the venue reports as locked;
+   the venue's own Balances tab shows `total` and `total - hold`.
+   USDC only: it is the sole perp collateral, and the panels that consume this need a
+   collateral figure rather than a spot portfolio. */
+typedef struct { pc_usd total, hold; } pc_spot;
 typedef struct { uint16_t status; uint64_t oid; pc_qty filled_sz; pc_px avg_px; char err[PC_ERR_LEN]; } pc_order_ack;
 /* `rtt_us` is the last measured WebSocket ping/pong round trip in microseconds, 0 when not
    yet measured. It is the only latency figure that is actually a round trip -- the per-feed
@@ -156,7 +171,7 @@ typedef struct {
     union {
         pc_l2 l2; pc_bbo bbo; pc_trade trade; pc_candle candle; pc_asset_ctx asset_ctx;
         pc_asset_data asset_data; pc_fee_rates fee_rates; pc_order_update order_update; pc_fill fill;
-        pc_position position; pc_account account; pc_order_ack ack; pc_conn conn;
+        pc_position position; pc_account account; pc_spot spot; pc_order_ack ack; pc_conn conn;
         pc_rate rate; pc_error error; pc_funding funding;
     } u;
 } pc_event;

@@ -25,6 +25,7 @@ pub const PC_EV_RATE: u16 = 13;
 pub const PC_EV_ERROR: u16 = 14;
 pub const PC_EV_FUNDING: u16 = 15;
 pub const PC_EV_FEE_RATES: u16 = 16;
+pub const PC_EV_SPOT_BALANCE: u16 = 17;
 
 /// The highest `PC_EV_*` value that counts as market data for `EventQueue`'s
 /// drop-oldest-on-overflow policy (docs/02 §4.1) — kinds 1..=5. Everything above this
@@ -62,6 +63,7 @@ pub const PC_FETCH_CANDLE_SNAPSHOT: u32 = 7;
 pub const PC_FETCH_ACTIVE_ASSET_DATA: u32 = 8;
 pub const PC_FETCH_USER_RATE_LIMIT: u32 = 9;
 pub const PC_FETCH_USER_FEES: u32 = 10;
+pub const PC_FETCH_SPOT_STATE: u32 = 11;
 
 // ---- pc_order_ack::status (PC_ACK_*) ----
 pub const PC_ACK_RESTING: u16 = 0;
@@ -270,11 +272,22 @@ pub struct PcPosition {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct PcAccount {
+    /// `marginSummary.accountValue` — cross **and** isolated.
     pub account_value: i64,
+    /// `crossMarginSummary.accountValue` — the equity that actually backs cross positions.
+    pub cross_account_value: i64,
     pub total_margin_used: i64,
     pub total_ntl_pos: i64,
     pub withdrawable: i64,
     pub cross_maintenance_margin: i64,
+}
+/// The USDC row of `spotClearinghouseState`. See `pc_spot` in include/parsec/parsec.h:
+/// `total` already contains the equity deployed in perps, it is not money beside it.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct PcSpot {
+    pub total: i64,
+    pub hold: i64,
 }
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -332,6 +345,7 @@ pub union PcEventUnion {
     pub fill: PcFill,
     pub position: PcPosition,
     pub account: PcAccount,
+    pub spot: PcSpot,
     pub ack: PcOrderAck,
     pub conn: PcConn,
     pub rate: PcRate,
@@ -397,6 +411,8 @@ mod tests {
     fn abi_layout() {
         assert_eq!(size_of::<PcLevel>(), 24);
         assert_eq!(size_of::<PcFeeRates>(), 16);
+        assert_eq!(size_of::<PcAccount>(), 48);
+        assert_eq!(size_of::<PcSpot>(), 16);
         assert_eq!(size_of::<PcEvent>(), 1192);
         assert_eq!(offset_of!(PcEvent, u), 32);
         assert_eq!(align_of::<PcEvent>(), 8);

@@ -66,6 +66,11 @@ struct PortfolioSnapshot {
     static constexpr size_t kMaxPositions = 64;
     pc_account account{};
     bool account_valid{};
+    // The USDC spot row. Hyperliquid margins perps out of one USDC pool, so the part of this
+    // balance that is not already deployed as perp equity is spendable margin that
+    // `pc_account::withdrawable` cannot see -- see portfolio::free_collateral().
+    pc_spot spot{};
+    bool spot_valid{};
     // `activeAssetData` is account-scoped and only fetched for the selected asset. Keeping its
     // asset id beside the payload prevents a late response for the previous coin from being
     // rendered as the current coin's buying power.

@@ -33,6 +33,9 @@ constexpr uint64_t kFeeRatesRefreshIntervalMs = 60'000;
 // the reconciler cadence keeps the account-event path from adding anything the tick will not
 // already have refreshed.
 constexpr uint64_t kAssetDataRefreshIntervalMs = kReconcileIntervalMs;
+// spotClearinghouseState is `info` weight 2 -- the same class as clearinghouseState -- so
+// pulling it beside every account snapshot costs almost nothing against the 1200/min budget.
+constexpr uint64_t kSpotStateRefreshIntervalMs = kReconcileIntervalMs;
 
 // Divergence tolerance for the position reconciler, in Qty (1e8-scaled) units. Dust-level
 // drift between an optimistic fill-projection and the next venue snapshot (e.g. from a
@@ -254,9 +257,11 @@ void Engine::apply_event(const pc_event& event) noexcept {
                 positions_.clear();
                 reconcile_batch_.clear();
             }
-            account_ = event.u.account;
             account_valid_ = true;
             // Re-bases both AccountState's authoritative and optimistic views (docs/02 §6.4).
+            // AccountState is the ONLY copy of the account snapshot the engine keeps; a second
+            // plain `pc_account` member beside it is what let the published snapshot silently
+            // bypass the optimistic projection.
             account_state_.apply_authoritative(event.u.account);
             // First proof this session is authenticated: pull the history the three history
             // tables would otherwise only be able to show from the moment the app opened.
@@ -277,6 +282,19 @@ void Engine::apply_event(const pc_event& event) noexcept {
                 pc_fetch(ffi_, PC_FETCH_USER_FEES, nullptr);
                 last_fee_rates_fetch_ms_ = unix_ms();
             }
+            // The spot USDC row is half of free collateral (portfolio::free_collateral), and
+            // the other half just changed -- so it is refreshed on the same cadence as the
+            // account snapshot rather than on a slower clock of its own, or the two halves
+            // would be marked at different instants and their sum would jitter.
+            if (unix_ms() - last_spot_fetch_ms_ >= kSpotStateRefreshIntervalMs) {
+                pc_fetch(ffi_, PC_FETCH_SPOT_STATE, nullptr);
+                last_spot_fetch_ms_ = unix_ms();
+            }
+            break;
+
+        case PC_EV_SPOT_BALANCE:
+            spot_ = event.u.spot;
+            spot_valid_ = true;
             break;
 
         case PC_EV_ASSET_DATA:
@@ -633,7 +651,15 @@ void Engine::publish(uint64_t now_ms) noexcept {
     if (asset != PC_ASSET_NONE)
         markets_.snapshot(asset, now_ms, staleness_cfg_, instrument);
     bridge_.publish_instrument(instrument);
-    auto portfolio = make_portfolio_snapshot(account_, account_valid_, positions_);
+    // The OPTIMISTIC account: AccountState nudges account value and withdrawable the instant a
+    // fill lands (docs/02 §6.4) and is re-based on every venue snapshot ~4 s later. Publishing
+    // the raw authoritative value instead left that nudge computed and then thrown away, so
+    // the Balances tab and the ticket's free margin sat on a stale figure for up to a full
+    // snapshot interval after every fill.
+    auto portfolio =
+        make_portfolio_snapshot(account_state_.optimistic(), account_valid_, positions_);
+    portfolio.spot = spot_;
+    portfolio.spot_valid = spot_valid_;
     if (asset_data_valid_ && asset_data_asset_ == asset) {
         portfolio.asset_data = asset_data_;
         portfolio.asset_data_asset = asset_data_asset_;

@@ -150,8 +150,12 @@ private:
     md::MarketStore markets_{};
     md::StalenessConfig staleness_cfg_{};
     portfolio::PositionBook positions_{};
-    pc_account account_{};
+    // The account snapshot itself lives in `account_state_` below -- this only records that
+    // one has arrived, which is what gates order entry and the account-scoped fetches.
     bool account_valid_{};
+    pc_spot spot_{};
+    bool spot_valid_{};
+    uint64_t last_spot_fetch_ms_{};
     pc_asset_data asset_data_{};
     uint32_t asset_data_asset_{PC_ASSET_NONE};
     bool asset_data_valid_{};

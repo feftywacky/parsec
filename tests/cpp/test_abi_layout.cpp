@@ -43,7 +43,8 @@ static_assert(offsetof(pc_order_update, trigger_px) == 56,
               "trigger_px must sit after orig_sz, before the flag bytes");
 static_assert(sizeof(pc_fill) == 72);
 static_assert(sizeof(pc_position) == 72);
-static_assert(sizeof(pc_account) == 40);
+static_assert(sizeof(pc_account) == 48);
+static_assert(sizeof(pc_spot) == 16);
 static_assert(sizeof(pc_order_ack) == 224);
 static_assert(sizeof(pc_conn) == 12);
 static_assert(sizeof(pc_rate) == 16);

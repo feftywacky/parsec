@@ -197,6 +197,29 @@ pub struct ClearinghouseState {
 }
 
 // ---------------------------------------------------------------------------------
+// spotClearinghouseState
+// ---------------------------------------------------------------------------------
+
+/// One spot token row. `total` is the whole balance; `hold` is the part the venue has
+/// locked (resting spot orders, and — for USDC — the part deployed as perp collateral).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotBalance {
+    pub coin: String,
+    pub token: u32,
+    pub total: String,
+    pub hold: String,
+    #[serde(default)]
+    pub entry_ntl: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotClearinghouseState {
+    pub balances: Vec<SpotBalance>,
+}
+
+// ---------------------------------------------------------------------------------
 // openOrders / frontendOpenOrders
 // ---------------------------------------------------------------------------------
 
@@ -515,6 +538,26 @@ mod tests {
                 .as_deref(),
             Some("-95.059824")
         );
+    }
+
+    /// Live mainnet shape. `tokenToAvailableAfterMaintenance` rides along undocumented and is
+    /// ignored; note that it equals USDC `total` minus `crossMaintenanceMarginUsed`, which is
+    /// the venue itself treating the whole spot USDC balance as perp collateral.
+    #[test]
+    fn spot_clearinghouse_state_decodes_the_usdc_row() {
+        let json = r#"{
+          "balances":[
+            {"coin":"USDC","token":0,"total":"11256.53161","hold":"9821.917863",
+             "entryNtl":"0.0"},
+            {"coin":"USDH","token":360,"total":"0.0","hold":"0.0","entryNtl":"0.0"}
+          ],
+          "tokenToAvailableAfterMaintenance":[[0,"10522.568095"]]
+        }"#;
+        let state: SpotClearinghouseState = serde_json::from_str(json).unwrap();
+        let usdc = state.balances.iter().find(|b| b.coin == "USDC").unwrap();
+        assert_eq!(usdc.token, 0);
+        assert_eq!(parse_scaled(&usdc.total).unwrap(), 1_125_653_161_000);
+        assert_eq!(parse_scaled(&usdc.hold).unwrap(), 982_191_786_300);
     }
 
     #[test]

@@ -58,7 +58,8 @@ pub async fn dispatch(
         | PC_FETCH_HISTORICAL_ORDERS
         | PC_FETCH_ACTIVE_ASSET_DATA
         | PC_FETCH_USER_RATE_LIMIT
-        | PC_FETCH_USER_FEES => match session {
+        | PC_FETCH_USER_FEES
+        | PC_FETCH_SPOT_STATE => match session {
             None => Err(
                 "this fetch needs the account's master address, which is only known \
                  once an agent keystore is unlocked"
@@ -90,6 +91,9 @@ pub async fn dispatch(
                         fetch_user_rate_limit(&http, &events, &session, &master, req_id).await
                     }
                     PC_FETCH_USER_FEES => fetch_user_fees(&http, &events, &master, req_id).await,
+                    PC_FETCH_SPOT_STATE => {
+                        fetch_spot_state(&http, &events, &master, req_id).await
+                    }
                     _ => unreachable!("matched by the outer arm"),
                 }
             }
@@ -319,6 +323,11 @@ pub(crate) fn push_clearinghouse_state(
     account_event.u = PcEventUnion {
         account: PcAccount {
             account_value: parse_scaled(&state.margin_summary.account_value).unwrap_or(0),
+            // Cross-only equity. `crossMaintenanceMarginUsed` below is cross-only too, and a
+            // liquidation calculation that pairs it with the cross+isolated `marginSummary`
+            // figure overstates the cushion by every isolated position's equity.
+            cross_account_value: parse_scaled(&state.cross_margin_summary.account_value)
+                .unwrap_or(0),
             total_margin_used: parse_scaled(&state.margin_summary.total_margin_used).unwrap_or(0),
             total_ntl_pos: parse_scaled(&state.margin_summary.total_ntl_pos).unwrap_or(0),
             withdrawable: parse_scaled(&state.withdrawable).unwrap_or(0),
@@ -709,6 +718,40 @@ async fn fetch_user_fees(
             // `userAddRate` is the effective maker/add rate and may be negative for a rebate.
             maker_rate: parse_scaled(&fees.user_add_rate).unwrap_or(0),
             taker_rate: parse_scaled(&fees.user_cross_rate).unwrap_or(0),
+        },
+    };
+    events.push(event);
+    Ok(())
+}
+
+/// The account's USDC spot row. Hyperliquid collateralises perps from a single USDC pool, so
+/// this is not a side ledger: the USDC that is not currently deployed as perp equity is what
+/// funds the next position, and `clearinghouseState.withdrawable` does not see it at all
+/// (measured: on an account with 37.46 withdrawable and 1433.79 undeployed USDC, the venue's
+/// own `activeAssetData.availableToTrade` for the opening side read 1471.24).
+///
+/// A missing USDC row means "no USDC anywhere", which is a zero balance, not an error — the
+/// event still goes out so the UI can stop showing the field as pending.
+async fn fetch_spot_state(
+    http: &HttpClient,
+    events: &EventQueue,
+    master: &str,
+    req_id: u64,
+) -> Result<(), String> {
+    let body = json!({"type": "spotClearinghouseState", "user": master});
+    let value = http
+        .post_info_with_retry(&body, |ms| events.push(rate_event(ms, req_id)))
+        .await
+        .map_err(|e| format!("spotClearinghouseState fetch failed: {e}"))?;
+    let state: info::SpotClearinghouseState = serde_json::from_value(value)
+        .map_err(|e| format!("spotClearinghouseState decode failed: {e}"))?;
+    let usdc = state.balances.iter().find(|b| b.coin == "USDC");
+    let mut event = base_event(PC_EV_SPOT_BALANCE, PC_ASSET_NONE, 0, req_id);
+    event.flags = PC_F_SNAPSHOT;
+    event.u = PcEventUnion {
+        spot: PcSpot {
+            total: usdc.and_then(|b| parse_scaled(&b.total).ok()).unwrap_or(0),
+            hold: usdc.and_then(|b| parse_scaled(&b.hold).ok()).unwrap_or(0),
         },
     };
     events.push(event);

@@ -2,6 +2,8 @@
 
 #include <imgui.h>
 
+#include "portfolio/collateral.hpp"
+#include "portfolio/live_marks.hpp"
 #include "portfolio/order_preview.hpp"
 #include "ui/app_window.hpp"
 #include "ui/asset_lookup.hpp"
@@ -13,68 +15,23 @@ namespace pc::ui {
 namespace {
 
 // Every figure below is derived from a `clearinghouseState` snapshot that lands about every
-// 4s. The Positions tab does NOT show that vintage: it re-marks the row on screen from the
-// live activeAssetCtx mark on every frame (panel_positions.cpp, `row_mark`), so PnL there
-// ticks with the market. Printing the raw snapshot here meant the two tabs disagreed with each
-// other at the same instant -- Positions saying mark 78,869 / unrealized $935 while Balances
-// still carried mark 78,911 / unrealized $904, a ~$31 gap in account value that read as "the
-// Balances tab is not updating". So this applies the same live re-mark, and the two tabs now
-// move together.
+// 4s, re-marked to the live mark by portfolio::apply_live_mark -- see that header for why the
+// raw snapshot cannot be printed beside the Positions tab, and for the cross/isolated split.
 //
 // Only the instrument on screen has a live mark; for every other position `row_mark` recovers
 // the venue's own mark from `position_value / |szi|`, which is the snapshot mark exactly, so
 // those contribute nothing and the totals stay the venue's numbers.
-struct LiveMarks {
-    Usd account_value{};
-    Usd total_margin_used{};
-    Usd total_ntl_pos{};
-    Usd withdrawable{};
-    Usd maintenance{};
-};
-
-LiveMarks live_marks(const PanelContext& ctx) noexcept {
-    const pc_account& a = ctx.portfolio.account;
-    LiveMarks out{a.account_value, a.total_margin_used, a.total_ntl_pos, a.withdrawable,
-                  a.cross_maintenance_margin};
-
+portfolio::AccountMarks live_marks(const PanelContext& ctx) noexcept {
+    portfolio::AccountMarks out = portfolio::account_marks(ctx.portfolio.account);
     const Px live_mark = ctx.instrument.ctx.mark_px();
-    if (live_mark <= 0)
-        return out;
-
     for (uint32_t i = 0; i < ctx.portfolio.position_count; ++i) {
         const portfolio::Position& row = ctx.portfolio.positions[i];
         if (row.asset != ctx.instrument.asset)
             continue;
-        const pc_position& p = row.value;
-        const Qty abs_size = p.szi < 0 ? -p.szi : p.szi;
-        if (abs_size <= 0 || p.position_value == 0 || p.leverage == 0)
-            continue;
-
-        const Usd snap_value = p.position_value < 0 ? -p.position_value : p.position_value;
-        const Usd live_value = notional(live_mark, abs_size);
-        const Usd d_value = live_value - snap_value;
-        if (d_value == 0)
-            continue;
-
-        // A long gains when the position is worth more; a short loses by the same amount.
-        const Usd d_unrealized = p.szi > 0 ? d_value : -d_value;
-        const Usd d_margin = portfolio::initial_margin(live_value, p.leverage) -
-                             portfolio::initial_margin(snap_value, p.leverage);
-
-        out.account_value += d_unrealized;
-        out.total_ntl_pos += d_value;
-        out.total_margin_used += d_margin;
-        // Equity moved by the PnL and the margin requirement moved with the notional; free
-        // cash is what is left of the first after the second.
-        out.withdrawable += d_unrealized - d_margin;
-
-        if (p.is_cross != 0) {
-            const AssetLabel label = lookup_asset(ctx.universe, row.asset, ctx.sz_decimals);
-            const Usd rate = portfolio::maintenance_rate_for_max_leverage(label.max_leverage);
-            if (rate > 0)
-                out.maintenance += portfolio::maintenance_margin(live_value, rate) -
-                                   portfolio::maintenance_margin(snap_value, rate);
-        }
+        const AssetLabel label = lookup_asset(ctx.universe, row.asset, ctx.sz_decimals);
+        portfolio::apply_live_mark(
+            out, row.value, live_mark,
+            portfolio::maintenance_rate_for_max_leverage(label.max_leverage));
     }
     return out;
 }
@@ -93,46 +50,76 @@ void draw_balances(PanelContext& ctx) {
         return;
     }
 
-    const LiveMarks m = live_marks(ctx);
+    const portfolio::AccountMarks m = live_marks(ctx);
     char buf[32];
 
+    // Wide enough for the longest label ("Cross maintenance margin", 24). At 22 the two labels
+    // already past it pushed their own value a column right of every other row.
     auto row = [&](const char* label, pc::Usd v) {
         format_usd(v, buf, sizeof(buf));
-        ImGui::Text("%-22s", label);
+        ImGui::Text("%-26s", label);
         ImGui::SameLine();
         ImGui::Text("%s", buf);
     };
+
+    // USDC first, because it is the account's actual balance and everything below is derived
+    // from it. Hyperliquid collateralises perps from one USDC pool, so `spot.total` is not a
+    // separate wallet sitting beside the perp account -- it CONTAINS the perp equity, which is
+    // why "Total balance" reads larger than "Account value" by exactly the idle balance. These
+    // two lines are the venue's own Balances tab.
+    //
+    // USDC only: it is the sole perp collateral. A spot portfolio would need spotMeta and per
+    // token marks to price the other rows, which is a different feature.
+    //
+    // "Available balance" is NOT "Available margin" further down and the two do not have to
+    // agree: this one is the idle USDC the venue reports as unheld, while free margin also
+    // counts the perp side's own free cash, so it sits about `withdrawable` higher.
+    if (ctx.portfolio.spot_valid) {
+        const pc_spot& spot = ctx.portfolio.spot;
+        row("Total balance (USDC)", spot.total);
+        row("Available balance", std::max<Usd>(0, spot.total - spot.hold));
+        ImGui::Spacing();
+    }
 
     row("Account value", m.account_value);
     row("Total margin used", m.total_margin_used);
     row("Total notional position", m.total_ntl_pos);
     row("Withdrawable", m.withdrawable);
 
-    // Free collateral: the USDC sitting in the account that is NOT backing a position and can
-    // therefore fund a new one. That is `withdrawable` -- the venue's own answer to "what can
-    // leave the account", which is the same question as "what can enter a new position".
+    // Free collateral: the USDC that can back a NEW position.
     //
     // NOT `account_value - total_margin_used`. That subtraction looks equivalent but is not:
     // `total_margin_used` is marked to market, so it grows as a position moves against you,
     // while the margin behind that position was already posted at entry. The difference goes
     // negative on any ordinary adverse move -- a 10x position needs 10% initial margin against
     // ~1.25% maintenance, so equity sits below the initial requirement long before anything is
-    // at risk -- and reported "-$44.97 available", which is not a quantity of anything. The
-    // venue never reports `withdrawable` below zero; the clamp guards the live re-mark above,
-    // not the venue.
-    const Usd available = std::max<Usd>(0, m.withdrawable);
+    // at risk -- and reported "-$44.97 available", which is not a quantity of anything.
+    //
+    // NOT `withdrawable` alone either, which is what this line used to be. That is the PERP
+    // side's free cash and cannot see USDC that has never been deployed into perps: measured
+    // against mainnet it read $37 while the venue's own `availableToTrade` for the opening
+    // side said $1,471, because $1,434 of the balance was simply idle. free_collateral() adds
+    // the idle part back; the clamp inside it guards the live re-mark above, not the venue.
+    const Usd available = portfolio::free_collateral(m.account_value, m.withdrawable,
+                                                     ctx.portfolio.spot, ctx.portfolio.spot_valid);
     format_usd(available, buf, sizeof(buf));
-    ImGui::Text("%-22s", "Available margin");
+    ImGui::Text("%-26s", "Available margin");
     ImGui::SameLine();
     ImGui::Text("%s", buf);
 
-    row("Maintenance margin", m.maintenance);
+    // Cross-only, like the venue's `crossMaintenanceMarginUsed` it comes from: an isolated
+    // position's maintenance requirement is charged against its own walled-off collateral and
+    // is not part of this number. Labelled so, because pairing it with the cross+isolated
+    // account value below would otherwise read as a whole-account safety margin.
+    row("Cross maintenance margin", m.cross_maintenance);
 
     // Zero free collateral stops new positions but says nothing about safety, so the cushion
     // over the maintenance requirement -- the number that actually tracks liquidation -- goes
-    // next to it rather than leaving "$0.00" to be read as distress.
+    // next to it rather than leaving "$0.00" to be read as distress. Cross equity against
+    // cross maintenance: isolated equity cannot be pulled in to defend a cross position, so
+    // including it here would overstate the cushion by the whole isolated book.
     if (available <= 0 && ctx.portfolio.position_count > 0) {
-        const Usd cushion = m.account_value - m.maintenance;
+        const Usd cushion = m.cross_account_value - m.cross_maintenance;
         char cushion_buf[32];
         format_usd(cushion > 0 ? cushion : -cushion, cushion_buf, sizeof(cushion_buf));
         if (cushion > 0)

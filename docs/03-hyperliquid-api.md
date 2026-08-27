@@ -181,6 +181,43 @@ Intervals (verbatim): `"1m","3m","5m","15m","30m","1h","2h","4h","8h","12h","1d"
 `liquidationPx` may be `null`. `szi` is signed (negative = short). `marginSummary` covers
 cross + isolated; `crossMarginSummary` covers cross only.
 
+For an isolated position, **`marginUsed` is the position's whole equity**, not a fraction of
+its notional: it is `positionValue + rawUsd` with `rawUsd` fixed at entry (above: `100.02765 -
+95.059824 = 4.967826`), so it tracks the mark one-for-one rather than at `1/leverage` the way
+a cross position's does.
+
+**`withdrawable` is not free margin** — see `spotClearinghouseState` below.
+
+### `spotClearinghouseState`
+
+```json
+{"type":"spotClearinghouseState","user":"0x..."}
+```
+```json
+{"balances":[{"coin":"USDC","token":0,"total":"11256.53161","hold":"9821.917863",
+              "entryNtl":"0.0"}],
+ "tokenToAvailableAfterMaintenance":[[0,"10522.568095"]]}
+```
+`tokenToAvailableAfterMaintenance` is undocumented and equals USDC `total` minus
+`crossMaintenanceMarginUsed` **[MEASURED]** — the venue itself netting a *perp* requirement out
+of the *spot* balance.
+
+**USDC is one collateral pool [MEASURED].** The USDC `total` here is every USDC the account
+holds and it **contains** `marginSummary.accountValue`; the undeployed remainder is
+`total - accountValue`. Consequences:
+
+- `clearinghouseState.withdrawable` sees only the perp side and **understates free margin by
+  the whole undeployed balance**. Measured on one coherent snapshot: `withdrawable` 37.463671,
+  `total` 11254.28527, `accountValue` 9820.495181 — and the venue's own
+  `activeAssetData.availableToTrade` for the *opening* side read **1471.23762**, against
+  `37.463671 + (11254.28527 - 9820.495181) = 1471.253760`. Agreement to $0.02.
+- Free margin is therefore `withdrawable + max(0, spotUsdcTotal - marginSummary.accountValue)`.
+- `hold` lags the mark by a second or two and ran ~$20 off that identity, so it is right for a
+  *displayed* balance and wrong as a margin input. The venue's own Balances tab shows `total`
+  and `total - hold`.
+- On the *reducing* side `availableToTrade` is inflated by the margin that closing the existing
+  position would release, so only the opening side is a free-margin answer.
+
 ### `openOrders` / `frontendOpenOrders`
 
 ```json

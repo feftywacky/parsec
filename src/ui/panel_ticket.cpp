@@ -6,6 +6,7 @@
 
 #include "exec/rounder.hpp"
 #include "exec/slippage.hpp"
+#include "portfolio/collateral.hpp"
 #include "portfolio/order_preview.hpp"
 #include "ui/app_window.hpp"
 #include "ui/cloid.hpp"
@@ -434,10 +435,12 @@ void draw_ticket(PanelContext& ctx) {
             ctx.view.ticket_sz =
                 static_cast<Qty>(static_cast<__int128>(slider_max_qty) * pct / 100);
         } else if (!sizing_data_ready && ctx.portfolio.account_valid && sizing_ref > 0) {
-            // Fallback while the first activeAssetData response is in flight: withdrawable
-            // cash is margin, so it has to be multiplied by leverage to become a notional.
-            const __int128 budget = static_cast<__int128>(ctx.portfolio.account.withdrawable) *
-                                    ctx.view.ticket_leverage * pct / 100;
+            // Fallback while the first activeAssetData response is in flight: free collateral
+            // is margin, so it has to be multiplied by leverage to become a notional.
+            const __int128 budget =
+                static_cast<__int128>(portfolio::free_collateral(
+                    ctx.portfolio.account, ctx.portfolio.spot, ctx.portfolio.spot_valid)) *
+                ctx.view.ticket_leverage * pct / 100;
             const __int128 sz128 = budget * kScale / sizing_ref;
             ctx.view.ticket_sz = sz128 > 0 ? static_cast<Qty>(sz128) : 0;
         } else {
@@ -708,20 +711,25 @@ void draw_ticket(PanelContext& ctx) {
     const Px available_mark = data_for_asset && ctx.portfolio.asset_data.mark > 0
                                   ? ctx.portfolio.asset_data.mark
                                   : ctx.instrument.ctx.mark_px();
-    // Deliberately NOT activeAssetData's `availableToTrade`. That field is `maxTradeSzs * mark
-    // / leverage` -- the venue divides the whole side capacity by leverage, including the part
-    // of the capacity that merely CLOSES an existing position. Closing consumes no margin (it
-    // releases margin), so dividing it by leverage yields a number that is not any real
-    // quantity of margin: on a 0.75 BTC short at 10x it reported $12.7k of "available margin"
-    // against an account worth $6.8k. Free margin is an account-level fact, so it comes from
-    // the account snapshot and does not depend on the ticket's side.
     // Free collateral -- the USDC not backing a position, which is what can fund a new one.
-    // Same basis as the Balances tab (see panel_balances.cpp for why this is `withdrawable`
-    // and not `account_value - total_margin_used`, which goes negative on ordinary adverse
-    // moves and is not a quantity of anything). It also nets out margin locked by resting
-    // orders, which `total_margin_used` -- positions only -- does not.
+    // Same basis as the Balances tab: `withdrawable` (which already nets out margin locked by
+    // resting orders, unlike `total_margin_used`) PLUS the USDC that has never been deployed
+    // into perps, which `withdrawable` cannot see. Without the second term this line read $37
+    // against the venue's own $1,471, and the gate below then blocked the exact size the
+    // slider above offered.
+    //
+    // Still NOT read from activeAssetData's `availableToTrade`, even though free_collateral()
+    // now reproduces it to within a couple of cents. That field is `maxTradeSzs * mark /
+    // leverage`, and on the side that CLOSES an existing position the venue is dividing
+    // capacity that releases margin rather than spending it: on a 0.75 BTC short at 10x it
+    // reported $12.7k of "available margin" against an account worth $6.8k. Only the opening
+    // side is a free-margin answer, and which side that is depends on the position, so free
+    // margin stays an account-level fact computed from account-level inputs.
     const Usd available_margin =
-        ctx.portfolio.account_valid ? std::max<Usd>(0, ctx.portfolio.account.withdrawable) : 0;
+        ctx.portfolio.account_valid
+            ? portfolio::free_collateral(ctx.portfolio.account, ctx.portfolio.spot,
+                                         ctx.portfolio.spot_valid)
+            : 0;
     // The venue's own side-specific ceiling -- what Hyperliquid would reject on.
     const Qty max_trade_qty =
         data_for_asset
@@ -798,7 +806,13 @@ void draw_ticket(PanelContext& ctx) {
             const Usd total_maintenance =
                 other_maintenance +
                 portfolio::maintenance_margin(resulting_value, maintenance_rate);
-            margin_available = ctx.portfolio.account.account_value - total_maintenance;
+            // Cross equity, not `account_value`: the latter is `marginSummary` and includes
+            // every isolated position's margin and PnL, which is collateral this cross
+            // position can never draw on. Using it pushed the estimated liquidation price
+            // further away by the whole isolated book. `cross_maintenance_margin`, which
+            // `other_maintenance` comes from, is cross-only for the same reason -- the two
+            // have to be quoted on the same side of that line.
+            margin_available = ctx.portfolio.account.cross_account_value - total_maintenance;
         } else {
             Usd isolated_margin = 0;
             if (current_position && !current_position->value.is_cross) {
