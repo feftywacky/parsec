@@ -54,8 +54,9 @@ void draw_funding(PanelContext& ctx) {
         ImGui::TextDisabled("No funding payments.");
         ImGui::TextDisabled(
             "(The last 30 days, pulled once the account snapshot proves the session is\n"
-            "signed in, plus anything settled since. A position held for less than an hour\n"
-            "never pays funding, so an empty table here is a normal state, not a fault.)");
+            "signed in, plus anything the userFundings stream settles from here on. A\n"
+            "position held for less than an hour never pays funding, so an empty table\n"
+            "here is a normal state, not a fault.)");
         ImGui::End();
         return;
     }

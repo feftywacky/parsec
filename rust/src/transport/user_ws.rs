@@ -18,7 +18,7 @@ use crate::codec::{decimal::parse_scaled, info, ws_msg::string};
 use crate::ffi::{
     fetch::{
         fetch_clearinghouse_state, fetch_open_orders, fetch_user_fills_since, fill_event,
-        push_clearinghouse_state,
+        funding_event, push_clearinghouse_state,
     },
     queue::EventQueue,
     types::*,
@@ -342,12 +342,27 @@ fn parse_event(
             }
         }
         "userFundings" => {
-            // No dedicated event kind exists for funding payments — see
-            // `ffi::fetch::fetch_user_funding`'s doc comment for the same tradeoff on
-            // the REST side. Streaming fundings are dropped rather than force-fit,
-            // since (unlike the REST path) there is no `pc_fetch` caller waiting on a
-            // result here to disappoint; `PC_FETCH_USER_FUNDING` remains the
-            // documented way to get funding history into the event stream.
+            // The array key is `fundings`, undocumented, entries shaped exactly like the
+            // REST `userFunding` rows plus `nSamples` (docs/03 §W2.10). `PC_FETCH_USER_FUNDING`
+            // backfills 30 days once at login; without this branch a payment settling while
+            // the app is open never reached the table until a restart.
+            let Some(fundings) = data.get("fundings").and_then(Value::as_array) else {
+                return;
+            };
+            // Subscribing replays history, and reconnects replay it again. Flagging the
+            // snapshot keeps that honest downstream; the C++ store dedups on (asset, hour)
+            // so the replay cannot double-count against the REST backfill.
+            let is_snapshot = data
+                .get("isSnapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let flags = if is_snapshot { PC_F_SNAPSHOT } else { 0 };
+            for raw in fundings {
+                let Ok(entry) = serde_json::from_value::<info::FundingEntry>(raw.clone()) else {
+                    continue;
+                };
+                events.push(funding_event(registry, 0, flags, &entry));
+            }
         }
         "clearinghouseState" => {
             // Surface a decode failure rather than dropping it: this payload is the only

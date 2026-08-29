@@ -544,16 +544,34 @@ pub(crate) async fn fetch_user_fills_since(
     Ok(())
 }
 
-/// **Known ABI gap.** `include/parsec/parsec.h` has no `PC_EV_FUNDING` payload — the
-/// frozen header only models fills, order updates, positions, and account state, and
-/// this crate cannot add a variant to it. Funding payments are therefore surfaced
-/// through the closest existing shape, `pc_fill`, with a documented field remapping
-/// rather than silently dropping the data:
-/// `fee` = funding paid (positive = you paid, i.e. `-usdc`, matching `pc_fill::fee`'s
-/// existing "positive is a cost" convention), `qty` = position size (`szi`) at the
-/// funding timestamp, `px` = the funding rate itself (scaled), `oid`/`tid` = 0,
-/// `is_taker` = 0. `src/ui/panel_funding.cpp` does not consume this yet (see its own
-/// comment) — wiring the UI side is out of scope for this pass.
+/// One `PC_EV_FUNDING` event from a `userFunding` entry. Shared by the REST backfill
+/// below and the live `userFundings` stream in `transport::user_ws`, so both paths sign
+/// and scale a payment identically — the C++ store dedups the two by `(asset, hour)`.
+pub(crate) fn funding_event(
+    registry: &SharedRegistry,
+    req_id: u64,
+    flags: u16,
+    entry: &info::FundingEntry,
+) -> PcEvent {
+    let asset = registry.index_of(&entry.delta.coin);
+    let mut event = base_event(PC_EV_FUNDING, asset, entry.time, req_id);
+    event.flags = flags;
+    event.u = PcEventUnion {
+        funding: PcFunding {
+            // Signed as the venue reports it: negative is paid, positive is received.
+            // Verified against the docs/03 §userFunding fixture — a long position under a
+            // positive rate pays, and the venue writes that payment as a negative `usdc`.
+            usdc: parse_scaled(&entry.delta.usdc).unwrap_or(0),
+            szi: parse_scaled(&entry.delta.szi).unwrap_or(0),
+            // The funding rate carries more than 8 decimals on the wire (docs/09 §2.1),
+            // so it needs the rounding parser, not the strict one.
+            rate_1e8: parse_scaled_stat_rounded(&entry.delta.funding_rate).unwrap_or(0),
+            n_samples: entry.delta.n_samples.unwrap_or(0),
+        },
+    };
+    event
+}
+
 async fn fetch_user_funding(
     http: &HttpClient,
     events: &EventQueue,
@@ -575,8 +593,6 @@ async fn fetch_user_funding(
         serde_json::from_value(value).map_err(|e| format!("userFunding decode failed: {e}"))?;
     let n = entries.len();
     for (i, entry) in entries.iter().enumerate() {
-        let asset = registry.index_of(&entry.delta.coin);
-        let mut event = base_event(PC_EV_FUNDING, asset, entry.time, req_id);
         let mut flags = PC_F_SNAPSHOT;
         if i == 0 {
             flags |= PC_F_SNAPSHOT_BEGIN;
@@ -584,20 +600,7 @@ async fn fetch_user_funding(
         if i + 1 == n {
             flags |= PC_F_SNAPSHOT_END;
         }
-        event.flags = flags;
-        let usdc = parse_scaled(&entry.delta.usdc).unwrap_or(0);
-        event.u = PcEventUnion {
-            funding: PcFunding {
-                // Signed as the venue reports it: negative is paid, positive is received.
-                usdc,
-                szi: parse_scaled(&entry.delta.szi).unwrap_or(0),
-                // The funding rate carries more than 8 decimals on the wire (docs/09 §2.1),
-                // so it needs the rounding parser, not the strict one.
-                rate_1e8: parse_scaled_stat_rounded(&entry.delta.funding_rate).unwrap_or(0),
-                n_samples: entry.delta.n_samples.unwrap_or(0),
-            },
-        };
-        events.push(event);
+        events.push(funding_event(registry, req_id, flags, entry));
     }
     if n == 0 {
         events.push(PcEvent::error(0, "no funding history", req_id));
