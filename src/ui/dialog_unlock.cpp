@@ -191,7 +191,7 @@ bool UnlockDialog::draw(bool mainnet, const std::string& keystore_path) noexcept
         if (pending_) {
             // Argon2id at the SENSITIVE tier is ~3.5s and that is intentional (docs/06 §3);
             // saying so turns a hang into a wait.
-            ImGui::TextColored(kColorWarning, "Unlocking... (Argon2id, ~3.5s -- deliberately)");
+            ImGui::TextColored(kColorWarning, "Unlocking... (Argon2id)");
         } else if (error_[0] != '\0') {
             ImGui::TextColored(kColorAsk, "%s", error_);
         }

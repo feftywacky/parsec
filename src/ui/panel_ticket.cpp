@@ -8,6 +8,7 @@
 #include "exec/slippage.hpp"
 #include "portfolio/collateral.hpp"
 #include "portfolio/order_preview.hpp"
+#include "portfolio/pnl.hpp"
 #include "ui/app_window.hpp"
 #include "ui/cloid.hpp"
 #include "ui/panels.hpp"
@@ -68,11 +69,6 @@ struct TicketPrefs {
     bool settings_touched{false};
 };
 TicketPrefs g_prefs;
-
-// Width of the price/size entry fields. They are laid out with a hidden ImGui label so a unit
-// selector and the "Mid" shortcut can sit on the same row, which means the width has to be set
-// explicitly rather than inherited from the default full-width item.
-constexpr float kFieldWidth = 150.0F;
 
 // One take-profit or stop-loss leg, resolved from whatever unit the trader typed it into.
 // The panel computes this once per frame and uses the same struct for the preview line and
@@ -271,23 +267,100 @@ void draw_ticket(PanelContext& ctx) {
     if (only_isolated)
         ctx.view.ticket_cross = false;
 
-    // --- Market / Limit ---
-    if (ImGui::RadioButton("Limit", !ctx.view.ticket_market))
+    // --- Layout metrics -----------------------------------------------------------------
+    // Every widget on this panel used to carry a hard-coded width (150 for the entry fields,
+    // 80 for the unit combos, 120 for the side buttons, -160 for the slider) chosen against
+    // one docked width. At the width the ticket actually gets docked at, the trailing labels
+    // and the summary values ran off the right edge -- "Max buy 1x  1.61048 BTC ($1..." was
+    // clipped mid-number. These are derived from the panel instead, so the rows stay inside
+    // it at any width and end at the same x as each other.
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float panel_w = ImGui::GetContentRegionAvail().x;
+    const float gap = style.ItemSpacing.x;
+    auto text_w = [](const char* text) { return ImGui::CalcTextSize(text).x; };
+    auto button_w = [&](const char* text) { return text_w(text) + style.FramePadding.x * 2.0F; };
+    // A combo is text plus the arrow button, which ImGui draws at frame height.
+    const float unit_combo_w = text_w("USDC") + ImGui::GetFrameHeight() + style.FramePadding.x * 2.0F;
+    // One field width for price, size and both TP/SL legs, sized so the widest of those rows
+    // still fits: aligning them matters more than giving each row its own maximum, since
+    // ragged field edges are what made this column look unaligned.
+    const float trailing_w = std::max({button_w("Mid") + gap + text_w("Price"),
+                                       unit_combo_w + gap + text_w("Size"),
+                                       unit_combo_w + gap + text_w("Take profit")});
+    const float field_w = std::max(72.0F, panel_w - trailing_w - gap);
+    // Sliders keep only their own trailing label, so they run wider than the entry fields.
+    auto slider_w = [&](const char* label) { return std::max(72.0F, panel_w - text_w(label) - gap); };
+
+    auto push_margin_setting = [&](app::UiCommandKind kind) {
+        if (!ctx.portfolio.account_valid)
+            return;
+        app::UiCommand command{};
+        command.kind = kind;
+        command.asset = ctx.instrument.asset;
+        command.leverage = ctx.view.ticket_leverage;
+        command.is_cross = ctx.view.ticket_cross;
+        if (!ctx.bridge.push_command(command))
+            event_store().note_local("command queue full -- setting not sent, try again", 2);
+    };
+
+
+    // --- Mode / side selectors -----------------------------------------------------------
+    // Segmented buttons rather than ImGui's radio circles. Three of these rows sit on top of
+    // each other and the circles gave the panel three columns of bullet points to read past
+    // before the label; a filled segment says the same thing with the shape of the control.
+    // The inactive fill is drawn explicitly so hover cannot fall back to ImGui's grey, which
+    // on the side selector read as "this button is now Sell" mid-hover.
+    const ImVec4 kSegmentIdle{0.086F, 0.145F, 0.169F, 1.0F};
+    const ImVec4 kSegmentHover{0.129F, 0.204F, 0.235F, 1.0F};
+    // Neutral, deliberately colourless: green/red on this panel means long/short, and the
+    // mode rows sit directly above the side selector. Tinting "Cross" or "Limit" teal made
+    // three rows of green with one red half and read as though they were all side choices.
+    const ImVec4 kSegmentOn{0.208F, 0.286F, 0.318F, 1.0F};
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0F);
+    const float segment_w = std::max(64.0F, (panel_w - gap) * 0.5F);
+    auto segment = [&](const char* label, bool active, ImVec4 on_fill, ImVec4 on_text) {
+        ImGui::PushStyleColor(ImGuiCol_Button, active ? on_fill : kSegmentIdle);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, active ? on_fill : kSegmentHover);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, active ? on_fill : kSegmentHover);
+        ImGui::PushStyleColor(ImGuiCol_Text, active ? on_text : kColorTextMuted);
+        const bool clicked = ImGui::Button(label, ImVec2(segment_w, 0));
+        ImGui::PopStyleColor(4);
+        return clicked;
+    };
+
+    // Margin mode first: it is the account setting the rest of the ticket is priced under, and
+    // it is pushed to the venue on click, so it belongs above the order it applies to rather
+    // than buried under the leverage slider.
+    ImGui::BeginDisabled(only_isolated);
+    if (segment("Cross", ctx.view.ticket_cross, kSegmentOn, kColorTextPrimary) &&
+        !ctx.view.ticket_cross) {
+        ctx.view.ticket_cross = true;
+        g_prefs.settings_touched = true;
+        push_margin_setting(app::UiCommandKind::SetMarginMode);
+    }
+    ImGui::SameLine();
+    if (segment("Isolated", !ctx.view.ticket_cross, kSegmentOn, kColorTextPrimary) &&
+        ctx.view.ticket_cross) {
+        ctx.view.ticket_cross = false;
+        g_prefs.settings_touched = true;
+        push_margin_setting(app::UiCommandKind::SetMarginMode);
+    }
+    ImGui::EndDisabled();
+
+    if (segment("Limit", !ctx.view.ticket_market, kSegmentOn, kColorTextPrimary))
         ctx.view.ticket_market = false;
     ImGui::SameLine();
-    if (ImGui::RadioButton("Market", ctx.view.ticket_market))
+    if (segment("Market", ctx.view.ticket_market, kSegmentOn, kColorTextPrimary))
         ctx.view.ticket_market = true;
 
-    // --- Buy/Long vs Sell/Short ---
-    ImGui::PushStyleColor(ImGuiCol_Button, ctx.view.ticket_is_buy ? kColorBid : kColorTextMuted);
-    if (ImGui::Button("Buy / Long", ImVec2(120, 0)))
+    // The side selector carries the trade's own colour, filled, with the panel background as
+    // its text so the active half reads as a solid block rather than tinted text.
+    if (segment("Buy / Long", ctx.view.ticket_is_buy, kColorBid, kColorBg))
         ctx.view.ticket_is_buy = true;
-    ImGui::PopStyleColor();
     ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button, !ctx.view.ticket_is_buy ? kColorAsk : kColorTextMuted);
-    if (ImGui::Button("Sell / Short", ImVec2(120, 0)))
+    if (segment("Sell / Short", !ctx.view.ticket_is_buy, kColorAsk, kColorBg))
         ctx.view.ticket_is_buy = false;
-    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
 
     const Side side = ctx.view.ticket_is_buy ? Side::Buy : Side::Sell;
 
@@ -343,7 +416,7 @@ void draw_ticket(PanelContext& ctx) {
     }
     const Px live_mid = ctx.instrument.bbo.execution_mid();
     ImGui::BeginDisabled(ctx.view.ticket_market);
-    ImGui::SetNextItemWidth(kFieldWidth);
+    ImGui::SetNextItemWidth(field_w);
     if (ImGui::InputText("##ticket_px", g_prefs.px_buf, sizeof(g_prefs.px_buf))) {
         Px parsed{};
         if (parse_fixed(g_prefs.px_buf, &parsed))
@@ -371,7 +444,7 @@ void draw_ticket(PanelContext& ctx) {
         entry_ref = sizing_ref;
 
     // --- Size + unit selector + % slider ---
-    ImGui::SetNextItemWidth(kFieldWidth);
+    ImGui::SetNextItemWidth(field_w);
     if (ImGui::InputText("##ticket_sz", g_prefs.sz_buf, sizeof(g_prefs.sz_buf))) {
         Px parsed{};
         if (parse_fixed(g_prefs.sz_buf, &parsed)) {
@@ -382,7 +455,7 @@ void draw_ticket(PanelContext& ctx) {
     }
     const bool sz_field_active = ImGui::IsItemActive();
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(80.0F);
+    ImGui::SetNextItemWidth(unit_combo_w);
     if (ImGui::BeginCombo("##ticket_sz_unit", g_prefs.size_in_usd ? "USDC" : coin_name)) {
         if (ImGui::Selectable(coin_name, !g_prefs.size_in_usd) && g_prefs.size_in_usd) {
             g_prefs.size_in_usd = false;
@@ -396,19 +469,6 @@ void draw_ticket(PanelContext& ctx) {
     }
     ImGui::SameLine();
     ImGui::TextUnformatted("Size");
-    // Whichever unit is not being typed in, shown underneath, so a USD-denominated order still
-    // says how much coin it is about to buy (and the reverse).
-    if (entry_ref > 0 && ctx.view.ticket_sz > 0) {
-        char alt_buf[48];
-        if (g_prefs.size_in_usd) {
-            format_qty(ctx.view.ticket_sz, ctx.sz_decimals, alt_buf, sizeof(alt_buf));
-            ImGui::TextColored(kColorTextMuted, "= %s %s", alt_buf, coin_name);
-        } else {
-            format_usd(notional(entry_ref, ctx.view.ticket_sz), alt_buf, sizeof(alt_buf));
-            ImGui::TextColored(kColorTextMuted, "= %s USDC", alt_buf);
-        }
-    }
-
     // The venue's maxTradeSzs is the authoritative "largest size this side can open right now":
     // it already folds in free margin, the selected leverage, the existing position and the
     // margin mode. availableToTrade is the *margin* (USDC) behind that number, not a notional
@@ -428,7 +488,7 @@ void draw_ticket(PanelContext& ctx) {
     // Hidden label so the trailing text can say WHICH max without changing the widget's ImGui
     // ID mid-drag: "100%" of a locally-capped max is not 100% of the account's buying power,
     // and the slider is where that surprise would otherwise land.
-    ImGui::SetNextItemWidth(-160.0F);
+    ImGui::SetNextItemWidth(slider_w("% of max"));
     if (ImGui::SliderFloat("##ticket_pct", &g_prefs.pct_slider, 0.0F, 100.0F, "%.0f%%")) {
         const int64_t pct = static_cast<int64_t>(g_prefs.pct_slider);
         if (slider_max_qty > 0) {
@@ -496,7 +556,7 @@ void draw_ticket(PanelContext& ctx) {
         // unit, so toggling never silently reinterprets "2" as a $2 trigger (or 2%).
         auto unit_combo = [&](const char* id, TpSlUnit* unit, char* buf, size_t cap,
                               const TpSlLeg& leg) {
-            ImGui::SetNextItemWidth(80.0F);
+            ImGui::SetNextItemWidth(unit_combo_w);
             if (!ImGui::BeginCombo(id, tpsl_unit_label(*unit)))
                 return;
             auto option = [&](TpSlUnit candidate) {
@@ -522,7 +582,7 @@ void draw_ticket(PanelContext& ctx) {
 
         auto leg_row = [&](const char* field_id, const char* combo_id, const char* label,
                            char* buf, size_t cap, TpSlUnit* unit, bool is_tp) -> TpSlLeg {
-            ImGui::SetNextItemWidth(kFieldWidth);
+            ImGui::SetNextItemWidth(field_w);
             ImGui::InputText(field_id, buf, cap);
             // Resolved after the input so the preview reflects this frame's keystroke rather
             // than lagging it, and before the combo so a unit switch converts the value the
@@ -571,40 +631,21 @@ void draw_ticket(PanelContext& ctx) {
     // order too.
     const bool tpsl_blocked = (tp_leg.present && !tp_leg.valid) || (sl_leg.present && !sl_leg.valid);
 
-    auto push_margin_setting = [&](app::UiCommandKind kind) {
-        if (!ctx.portfolio.account_valid)
-            return;
-        app::UiCommand command{};
-        command.kind = kind;
-        command.asset = ctx.instrument.asset;
-        command.leverage = ctx.view.ticket_leverage;
-        command.is_cross = ctx.view.ticket_cross;
-        if (!ctx.bridge.push_command(command))
-            event_store().note_local("command queue full -- setting not sent, try again", 2);
-    };
-
     ctx.view.ticket_leverage =
         std::clamp(ctx.view.ticket_leverage, uint32_t{1}, std::max(max_leverage, uint32_t{1}));
     int leverage_i = static_cast<int>(ctx.view.ticket_leverage);
-    if (ImGui::SliderInt("Leverage", &leverage_i, 1, static_cast<int>(max_leverage), "%dx")) {
+    // Hidden label with the text drawn after it, like the % slider above: ImGui puts a normal
+    // slider label on the right anyway, and doing it by hand is what keeps the two sliders the
+    // same width instead of each ending wherever its own label happens to leave it.
+    ImGui::SetNextItemWidth(slider_w("Leverage"));
+    if (ImGui::SliderInt("##ticket_leverage", &leverage_i, 1, static_cast<int>(max_leverage),
+                         "%dx")) {
         ctx.view.ticket_leverage = static_cast<uint32_t>(leverage_i);
         g_prefs.settings_touched = true;
         push_margin_setting(app::UiCommandKind::SetLeverage);
     }
-    ImGui::BeginDisabled(only_isolated);
-    if (ImGui::RadioButton("Cross", ctx.view.ticket_cross)) {
-        ctx.view.ticket_cross = true;
-        g_prefs.settings_touched = true;
-        push_margin_setting(app::UiCommandKind::SetMarginMode);
-    }
     ImGui::SameLine();
-    if (ImGui::RadioButton("Isolated", !ctx.view.ticket_cross)) {
-        ctx.view.ticket_cross = false;
-        g_prefs.settings_touched = true;
-        push_margin_setting(app::UiCommandKind::SetMarginMode);
-    }
-    ImGui::EndDisabled();
-
+    ImGui::TextUnformatted("Leverage");
     ImGui::Separator();
 
     // --- Rounding preview: "what you see is what gets signed" (docs/02 §7) ---
@@ -637,6 +678,9 @@ void draw_ticket(PanelContext& ctx) {
         refresh_size_buf();
     }
 
+    // These lines are full sentences, not figures, and the panel is narrow: without a wrap
+    // point they ran under the neighbouring panel instead of onto a second line.
+    ImGui::PushTextWrapPos(0.0F);
     if (ctx.view.ticket_market && have_price) {
         char cap_disp[32];
         format_px(signed_px, ctx.sz_decimals, cap_disp, sizeof(cap_disp));
@@ -700,6 +744,7 @@ void draw_ticket(PanelContext& ctx) {
             }
         }
     }
+    ImGui::PopTextWrapPos();
 
     // --- Account-aware preview -------------------------------------------------------------
     // activeAssetData is the venue's authoritative, side-specific buying-power answer. The
@@ -850,9 +895,21 @@ void draw_ticket(PanelContext& ctx) {
     if (ImGui::BeginTable("ticket_account_summary", 2,
                           ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
         ImGui::TableSetupColumn("ticket_summary_label", ImGuiTableColumnFlags_WidthStretch,
-                                0.62F);
+                                0.55F);
         ImGui::TableSetupColumn("ticket_summary_value", ImGuiTableColumnFlags_WidthStretch,
-                                0.38F);
+                                0.45F);
+
+        // Values right-aligned against the panel edge rather than left-aligned at a 62%
+        // column split. Left-aligned, every figure started at a different place depending on
+        // its label, and the longest ones ran past the panel and got clipped mid-number.
+        const ImVec4 muted = style.Colors[ImGuiCol_TextDisabled];
+        auto summary_value = [&](ImVec4 color, const char* text) {
+            const float text_width = ImGui::CalcTextSize(text).x;
+            const float cell_w = ImGui::GetContentRegionAvail().x;
+            if (cell_w > text_width)
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + cell_w - text_width);
+            ImGui::TextColored(color, "%s", text);
+        };
 
         auto summary_usd = [&](const char* label, Usd value, ImVec4 color = kColorTextPrimary,
                                bool fine = false) {
@@ -865,7 +922,9 @@ void draw_ticket(PanelContext& ctx) {
             ImGui::TableNextColumn();
             ImGui::TextDisabled("%s", label);
             ImGui::TableNextColumn();
-            ImGui::TextColored(color, "%s USDC", value_buf);
+            char row_buf[64];
+            std::snprintf(row_buf, sizeof(row_buf), "%s USDC", value_buf);
+            summary_value(color, row_buf);
         };
         summary_usd("Order value", order_value);
         summary_usd("Margin required", margin_required);
@@ -883,7 +942,7 @@ void draw_ticket(PanelContext& ctx) {
             ImGui::TableNextColumn();
             ImGui::TextDisabled("%s", fee_label);
             ImGui::TableNextColumn();
-            ImGui::TextDisabled("Loading rate...");
+            summary_value(muted, "Loading rate...");
         }
 
         ImGui::TableNextRow();
@@ -894,16 +953,53 @@ void draw_ticket(PanelContext& ctx) {
         ImGui::TextDisabled("Available margin");
         ImGui::TableNextColumn();
         if (ctx.portfolio.account_valid) {
-            char usd_buf[32];
+            char usd_buf[32], avail_buf[64];
             format_usd(available_margin, usd_buf, sizeof(usd_buf));
-            ImGui::TextColored(available_margin > 0 ? kColorTextPrimary : kColorWarning,
-                               "%s USDC", usd_buf);
+            std::snprintf(avail_buf, sizeof(avail_buf), "%s USDC", usd_buf);
+            summary_value(available_margin > 0 ? kColorTextPrimary : kColorWarning, avail_buf);
         } else if (ctx.portfolio.account_valid || event_store().has_user_conn()) {
             // A live user socket means we are signed in; the account snapshot is simply still
             // in flight. Saying "connect account" there reads as though the unlock failed.
-            ImGui::TextDisabled("Loading account limits...");
+            summary_value(muted, "Loading account limits...");
         } else {
-            ImGui::TextDisabled("Connect account");
+            summary_value(muted, "Connect account");
+        }
+
+        // The same pool with open P&L taken out -- the USDC that is really there, rather than
+        // the venue's mark-to-market buying power. "Available margin" above counts unrealized
+        // gains as spendable (it is the number an order is gated on, so it has to), which means
+        // it climbs on a winning position without a dollar being banked and gives it all back
+        // when the mark turns. Only shown with positions open; flat, the two are the same
+        // number and printing it twice would suggest they are not.
+        if (ctx.portfolio.account_valid && ctx.portfolio.position_count > 0) {
+            Usd open_unrealized = 0;
+            Usd open_cost_basis = 0;
+            for (uint32_t i = 0; i < ctx.portfolio.position_count; ++i) {
+                const portfolio::Position& row = ctx.portfolio.positions[i];
+                open_unrealized +=
+                    row.asset == ctx.instrument.asset && available_mark > 0
+                        ? portfolio::unrealized_pnl(row.value.szi, row.value.entry_px,
+                                                    available_mark)
+                        : row.value.unrealized_pnl;
+                open_cost_basis += portfolio::position_cost_basis(row.value);
+            }
+            char cash_buf[32], cash_row[64];
+            format_usd(portfolio::cash_collateral(
+                           available_margin, ctx.portfolio.account.account_value, open_unrealized,
+                           open_cost_basis, ctx.portfolio.spot, ctx.portfolio.spot_valid),
+                       cash_buf, sizeof(cash_buf));
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("USDC (cash)");
+            ImGui::TableNextColumn();
+            std::snprintf(cash_row, sizeof(cash_row), "%s USDC", cash_buf);
+            summary_value(muted, cash_row);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Available margin with open P&L stripped out: what would still be\n"
+                    "free to trade if every open position were marked back to its entry.\n"
+                    "The line above is what the venue will actually let an order through\n"
+                    "on; this one is the money that is really in the account.");
         }
 
         if (slider_max_qty > 0) {
@@ -912,8 +1008,10 @@ void draw_ticket(PanelContext& ctx) {
             format_qty(slider_max_qty, ctx.sz_decimals, max_qty_buf, sizeof(max_qty_buf));
             format_usd(max_price > 0 ? notional(max_price, slider_max_qty) : 0, max_usd_buf,
                        sizeof(max_usd_buf));
-            std::snprintf(max_buf, sizeof(max_buf), "%s %s (%s USDC)", max_qty_buf, coin_name,
-                          max_usd_buf);
+            // Size only. Appending "($1,043 USDC)" made this the longest value in the table by
+            // some way and it was the row that clipped; the notional is one hover away and is
+            // the less-asked half of the question anyway.
+            std::snprintf(max_buf, sizeof(max_buf), "%s %s", max_qty_buf, coin_name);
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             // Notional, i.e. already multiplied by the selected leverage -- which is why it can
@@ -930,7 +1028,9 @@ void draw_ticket(PanelContext& ctx) {
                 ImGui::SetTooltip("Includes closing the open position: this size flattens it "
                                   "and opens the other way with the margin that frees up.");
             ImGui::TableNextColumn();
-            ImGui::TextColored(kColorTextPrimary, "%s", max_buf);
+            summary_value(kColorTextPrimary, max_buf);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s USDC of notional at the mark.", max_usd_buf);
         }
 
         ImGui::TableNextRow();
@@ -940,9 +1040,9 @@ void draw_ticket(PanelContext& ctx) {
         if (liquidation_px > 0) {
             char liq_buf[32];
             format_px(liquidation_px, ctx.sz_decimals, liq_buf, sizeof(liq_buf));
-            ImGui::TextColored(kColorWarning, "%s", liq_buf);
+            summary_value(kColorWarning, liq_buf);
         } else {
-            ImGui::TextDisabled("--");
+            summary_value(muted, "--");
         }
         ImGui::EndTable();
     }
@@ -955,6 +1055,7 @@ void draw_ticket(PanelContext& ctx) {
     // unreachable on a 10x position.
     // Direction comes from `resulting_szi`, the position the stop would actually protect, which
     // is also what `liquidation_px` was computed for.
+    ImGui::PushTextWrapPos(0.0F);
     if (sl_leg.valid && portfolio::stop_beyond_liquidation(sl_leg.trigger, liquidation_px,
                                                            resulting_szi)) {
         char sl_disp[32], liq_disp[32];
@@ -1014,6 +1115,8 @@ void draw_ticket(PanelContext& ctx) {
         !have_price || final_sz <= 0 || account_blocked || account_data_loading ||
         available_blocked || max_trade_blocked || tpsl_blocked;
 
+    ImGui::PopTextWrapPos();
+
     ImGui::Separator();
     ImGui::BeginDisabled(submit_blocked);
     // The "##submit" suffix is load-bearing, not cosmetic. ImGui derives a widget's identity
@@ -1023,7 +1126,14 @@ void draw_ticket(PanelContext& ctx) {
     // silently does nothing. The text before "##" is still what gets drawn.
     const char* label = ctx.view.ticket_is_buy ? "Buy / Long##ticket_submit"
                                                : "Sell / Short##ticket_submit";
-    ImGui::PushStyleColor(ImGuiCol_Button, ctx.view.ticket_is_buy ? kColorBid : kColorAsk);
+    // Hover/active pinned to the same fill as the button: ImGui's defaults are a blue-grey
+    // that made the submit button flash a different colour than the side it is about to trade.
+    const ImVec4 submit_fill = ctx.view.ticket_is_buy ? kColorBid : kColorAsk;
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0F);
+    ImGui::PushStyleColor(ImGuiCol_Button, submit_fill);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, submit_fill);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, submit_fill);
+    ImGui::PushStyleColor(ImGuiCol_Text, kColorBg);
     if (ImGui::Button(label, ImVec2(-1, 0))) {
         pc_order main_order{};
         main_order.asset = ctx.instrument.asset;
@@ -1093,7 +1203,8 @@ void draw_ticket(PanelContext& ctx) {
         }
         g_prefs.submit_note_ms = ctx.now_ms;
     }
-    ImGui::PopStyleColor();
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar();
     ImGui::EndDisabled();
 
     // Mirror any new warning/error toast into the note area. Placed after the submit handler so
@@ -1124,9 +1235,15 @@ void draw_ticket(PanelContext& ctx) {
     if (g_prefs.submit_note[0] != '\0') {
         if (ctx.now_ms - g_prefs.submit_note_ms > kSubmitNoteMs)
             g_prefs.submit_note[0] = '\0';
-        else
+        else {
+            // Venue rejections are sentences and routinely longer than the panel is wide.
+            // Braced: an unbraced `else` here guarded only the push, so the pop ran every
+            // frame the note was expired and tripped ImGui's stack assert.
+            ImGui::PushTextWrapPos(0.0F);
             ImGui::TextColored(g_prefs.submit_note_error ? kColorAsk : kColorBid, "%s",
                                g_prefs.submit_note);
+            ImGui::PopTextWrapPos();
+        }
     }
 
     ImGui::End();

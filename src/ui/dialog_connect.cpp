@@ -134,7 +134,7 @@ void ConnectDialog::start() noexcept {
 
         {
             std::lock_guard<std::mutex> lock(message_mutex_);
-            message_ = "Encrypting keystore (Argon2id, ~3.5s -- deliberately)...";
+            message_ = "Encrypting keystore (Argon2id)...";
         }
         if (pc_setup_write_keystore(setup, passphrase_, written_path_.c_str()) != 0) {
             fail("Approved, but could not write the keystore", setup);
