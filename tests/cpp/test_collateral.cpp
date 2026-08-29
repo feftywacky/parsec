@@ -166,3 +166,54 @@ TEST_CASE("apply_live_mark: no live mark, no position, or no move leaves the sna
     CHECK(m.account_value == base.account_value);
     CHECK(m.withdrawable == base.withdrawable);
 }
+
+// --- position_cost_basis / cash_collateral -----------------------------------------------
+
+TEST_CASE("position_cost_basis is entry notional over leverage, not the marked requirement") {
+    pc_position p{};
+    p.szi = kScale;  // 1 BTC long
+    p.entry_px = 80'000 * kScale;
+    p.leverage = 10;
+    p.position_value = 88'000 * kScale;  // mark ran to 88k
+    p.margin_used = 8'800 * kScale;      // venue's marked requirement, +$800 vs entry
+
+    CHECK(position_cost_basis(p) == 8'000 * kScale);
+
+    // A short posts the same cash: the sign of the size does not change what was paid in.
+    p.szi = -kScale;
+    CHECK(position_cost_basis(p) == 8'000 * kScale);
+}
+
+TEST_CASE("cash_collateral at 1x: an open gain is fully re-locked, so cash tracks free margin") {
+    // 1x cross long, cost basis 1,000, up 385 -- the shape from the ticket screenshot. At 1x
+    // the venue's requirement grows by the whole gain, so withdrawable does not move and cash
+    // must equal free margin rather than sitting 385 below it.
+    pc_spot spot{};
+    spot.total = 2'385 * kScale;  // 1,385 of perp equity + 1,000 idle
+    const Usd account_value = 1'385 * kScale;  // 1,000 posted + 385 open gain
+    const Usd free = 1'000 * kScale;  // idle USDC; withdrawable is 0 at 1x
+
+    CHECK(cash_collateral(free, account_value, 385 * kScale, 1'000 * kScale, spot, true) == free);
+}
+
+TEST_CASE("cash_collateral at 10x: the released part of a gain is spendable, the rest is not") {
+    // 10x: a 385 gain grows the requirement by 38.5, so 346.5 lands in withdrawable and free
+    // margin overstates real cash by exactly that much.
+    pc_spot spot{};
+    spot.total = 148'500'000'000;             // 1,485 = 1,000 idle + 100 posted + 385 gain
+    const Usd account_value = 485 * kScale;   // perp equity only: 100 posted + 385 gain
+    const Usd free = 134'650'000'000;  // 1,000 idle + 346.5 released
+
+    CHECK(cash_collateral(free, account_value, 385 * kScale, 100 * kScale, spot, true) ==
+          1'000 * kScale);
+}
+
+TEST_CASE("cash_collateral never exceeds free margin or goes negative") {
+    pc_spot spot{};
+    spot.total = 10'000 * kScale;
+    // Margin locked by resting orders lives only in `free`; the position figures cannot see it,
+    // so the cap is what keeps this from reporting money the venue would not let an order use.
+    CHECK(cash_collateral(50 * kScale, 10'000 * kScale, 0, 0, spot, true) == 50 * kScale);
+    // Underwater past the posted margin: clamped rather than reported as negative cash.
+    CHECK(cash_collateral(0, 100 * kScale, -900 * kScale, 1'000 * kScale, spot, false) == 0);
+}

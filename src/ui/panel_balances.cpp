@@ -5,6 +5,7 @@
 #include "portfolio/collateral.hpp"
 #include "portfolio/live_marks.hpp"
 #include "portfolio/order_preview.hpp"
+#include "portfolio/pnl.hpp"
 #include "ui/app_window.hpp"
 #include "ui/asset_lookup.hpp"
 #include "ui/panels.hpp"
@@ -106,6 +107,41 @@ void draw_balances(PanelContext& ctx) {
     ImGui::Text("%-26s", "Available margin");
     ImGui::SameLine();
     ImGui::Text("%s", buf);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "What can back a new position, marked to the current price -- so unrealized\n"
+            "P&L on open positions is spendable here and this number moves every tick.\n"
+            "The line below is the same pool with open P&L stripped out.");
+
+    // The same pool valued at cost. "Available margin" is the number the venue will actually
+    // let an order through on, but it counts unrealized gains as buying power, so a winning
+    // position makes it climb without a dollar being banked -- and it falls straight back the
+    // moment the mark turns. Sizing off it means sizing off a number that can evaporate, so
+    // the cash figure sits underneath it rather than in a tooltip.
+    Usd total_unrealized = 0;
+    Usd total_cost_basis = 0;
+    for (uint32_t i = 0; i < ctx.portfolio.position_count; ++i) {
+        const portfolio::Position& row = ctx.portfolio.positions[i];
+        total_unrealized += row.asset == ctx.instrument.asset && ctx.instrument.ctx.mark_px() > 0
+                                ? portfolio::unrealized_pnl(row.value.szi, row.value.entry_px,
+                                                            ctx.instrument.ctx.mark_px())
+                                : row.value.unrealized_pnl;
+        total_cost_basis += portfolio::position_cost_basis(row.value);
+    }
+    if (ctx.portfolio.position_count > 0) {
+        const Usd cash = portfolio::cash_collateral(available, m.account_value, total_unrealized,
+                                                    total_cost_basis, ctx.portfolio.spot,
+                                                    ctx.portfolio.spot_valid);
+        format_usd(cash, buf, sizeof(buf));
+        ImGui::Text("%-26s", "USDC available (cash)");
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", buf);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Available margin with open P&L removed: idle USDC, plus account equity\n"
+                "valued at entry, minus the margin already posted. Sizing off this rather\n"
+                "than the line above means never sizing off a paper gain.");
+    }
 
     // Cross-only, like the venue's `crossMaintenanceMarginUsed` it comes from: an isolated
     // position's maintenance requirement is charged against its own walled-off collateral and

@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "exec/rounder.hpp"
+#include "portfolio/collateral.hpp"
 #include "portfolio/order_preview.hpp"
 #include "portfolio/pnl.hpp"
 #include "ui/app_window.hpp"
@@ -421,10 +422,12 @@ void draw_positions(PanelContext& ctx) {
     // --- Account summary strip ---------------------------------------------------------
     Usd total_unrealized = 0;
     Usd total_margin = 0;
+    Usd total_cost = 0;
     for (uint32_t i = 0; i < ctx.portfolio.position_count; ++i) {
         const portfolio::Position& row = ctx.portfolio.positions[i];
         total_unrealized += resolve_row(ctx, row).unrealized;
         total_margin += row.value.margin_used;
+        total_cost += portfolio::position_cost_basis(row.value);
     }
     const RealizedRow& realized_total = event_store().realized_total();
 
@@ -501,6 +504,18 @@ void draw_positions(PanelContext& ctx) {
     ImGui::SameLine();
     ImGui::TextUnformatted(format_usd(total_margin, buf, sizeof(buf)));
 
+    // Beside it because "margin used" alone does not answer "how much of my own money is in
+    // the book": it is marked to market, so it moves with every tick and quietly folds open
+    // P&L into what reads as a deposit. This one is valued at entry and does not.
+    ImGui::SameLine();
+    ImGui::TextDisabled("|  Cost basis");
+    ImGui::SameLine();
+    ImGui::TextUnformatted(format_usd(total_cost, buf, sizeof(buf)));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "USDC actually posted to open the open positions: entry notional over\n"
+            "leverage, summed. Unlike margin used it does not move with the mark.");
+
     if (ctx.portfolio.position_count > 0) {
         ImGui::SameLine();
         if (ImGui::Button("Close All"))
@@ -537,7 +552,7 @@ void draw_positions(PanelContext& ctx) {
     }
 
     if (ImGui::BeginTable(
-            "positions", 11,
+            "positions", 12,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                 ImGuiTableFlags_ScrollX)) {
         ImGui::TableSetupColumn("Market");
@@ -549,13 +564,14 @@ void draw_positions(PanelContext& ctx) {
         ImGui::TableSetupColumn("Realized PnL");
         ImGui::TableSetupColumn("Liq. Price");
         ImGui::TableSetupColumn("Margin");
+        ImGui::TableSetupColumn("Cost");
         ImGui::TableSetupColumn("Funding");
         ImGui::TableSetupColumn("");
 
         // Hand-rolled header row (rather than TableHeadersRow) so the columns whose meaning is
         // narrower than their label can carry a tooltip.
         ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
-        for (int column = 0; column < 11; ++column) {
+        for (int column = 0; column < 12; ++column) {
             if (!ImGui::TableSetColumnIndex(column))
                 continue;
             const char* name = ImGui::TableGetColumnName(column);
@@ -577,11 +593,31 @@ void draw_positions(PanelContext& ctx) {
                                         "the venue has not published one yet, in which case\n"
                                         "it is this client's own estimate.");
                     break;
+                case 8:
+                    header_with_tooltip(name,
+                                        "The venue's margin requirement for this position,\n"
+                                        "marked to the current price -- so it moves with the\n"
+                                        "mark and includes open P&L. For the cash you put in,\n"
+                                        "read the Cost column beside it.");
+                    break;
                 case 9:
                     header_with_tooltip(name,
-                                        "The venue's cumFunding.allTime for this position, in\n"
-                                        "its own convention: a positive number is funding\n"
-                                        "PAID, i.e. a cost, not a credit.");
+                                        "The USDC actually posted to open this position:\n"
+                                        "entry price x size / leverage. Fixed at entry, so it\n"
+                                        "does not move with the mark.\n\n"
+                                        "Approximate if the position was built at more than\n"
+                                        "one leverage setting, or topped up with isolated\n"
+                                        "margin: the venue publishes only the average entry\n"
+                                        "price and the current leverage.");
+                    break;
+                case 10:
+                    header_with_tooltip(name,
+                                        "Funding settled on this position, all-time, as P&L:\n"
+                                        "positive is funding you RECEIVED, negative is funding\n"
+                                        "you paid.\n\n"
+                                        "This is the venue's cumFunding.allTime with its sign\n"
+                                        "flipped -- that field counts funding paid, so it\n"
+                                        "reports a credit as a negative number.");
                     break;
                 default:
                     ImGui::TableHeader(name);
@@ -657,8 +693,12 @@ void draw_positions(PanelContext& ctx) {
                         "Closed P&L net of fees: %s in fees over %u fills this session.\n"
                         "Only counts size actually closed -- while the position is open this\n"
                         "is just the fees paid to open it.\n\n"
-                        "Trading only. Funding is the column to the right; the two are added\n"
-                        "together in the Realized (session) total above.",
+                        "Trading only -- read it against the Funding column to the right to\n"
+                        "separate entry/exit quality from carry.\n\n"
+                        "Note these two do NOT sum to the Realized total on the strip above:\n"
+                        "that folds in funding from `userFunding` (30 days, account-wide),\n"
+                        "while the column beside this one is this position's all-time\n"
+                        "cumFunding. Different sources, different windows.",
                         fees, realized.fills);
                 }
             } else {
@@ -685,11 +725,20 @@ void draw_positions(PanelContext& ctx) {
             ImGui::TextUnformatted(format_usd(p.margin_used, buf, sizeof(buf)));
 
             ImGui::TableNextColumn();
-            // Left uncoloured on purpose. Every other signed column here is a P&L whose sign
-            // means better/worse for the trader; this one is the venue's `cumFunding.allTime`
-            // in its own convention, where a positive number is funding PAID (a cost). Giving
-            // it the green/red treatment would read as the opposite of what it means.
-            ImGui::TextUnformatted(format_usd_fine(p.cum_funding, buf, sizeof(buf)));
+            ImGui::TextUnformatted(
+                format_usd(portfolio::position_cost_basis(p), buf, sizeof(buf)));
+
+            ImGui::TableNextColumn();
+            // Negated on purpose. The venue's `cumFunding.allTime` counts funding PAID, so a
+            // credit arrives as a negative number -- the inverse of every other signed column
+            // in this table, and the inverse of the funding figure on the summary strip above
+            // (which is summed from `userFunding`, where the venue writes a payment as
+            // negative `usdc`). Showing the raw field put two numbers for the same cash flow
+            // on one screen with opposite signs. Flipped here so the whole panel reads one
+            // way: positive/green is money earned, negative/red is money paid.
+            const Usd funding_pnl = -p.cum_funding;
+            ImGui::TextColored(funding_pnl >= 0 ? kColorBid : kColorAsk, "%s",
+                               format_usd_fine(funding_pnl, buf, sizeof(buf)));
 
             ImGui::TableNextColumn();
             if (ImGui::SmallButton("Close"))
