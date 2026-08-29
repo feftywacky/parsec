@@ -47,6 +47,62 @@ TEST_CASE("CandleSeries::backfill prepends only strictly-older history and keeps
     CHECK(series.at(2).c == 42);  // untouched by the overlapping backfill entry
 }
 
+TEST_CASE("CandleSeries::clear lets a re-fetch land after the series is abandoned") {
+    // The coin-switch path. A series left holding bars from before the unsubscribe sets
+    // backfill()'s horizon to those bars, and the next REST snapshot -- which spans up to
+    // *now* and is therefore entirely newer than that horizon -- is rejected wholesale,
+    // leaving the unsubscribed span as a permanent hole. clear() is what makes the return a
+    // genuine cold start.
+    pc::md::CandleSeries series;
+    pc_candle stale{};
+    stale.open_ms = 1000;  // cached just before the coin was switched away
+    stale.c = 42;
+    series.apply(stale);
+
+    // Coming back later: the snapshot covers the gap and the present, all of it newer than
+    // the stale bar's open_ms.
+    pc_candle refetch[3]{};
+    refetch[0].open_ms = 2000;
+    refetch[1].open_ms = 3000;
+    refetch[2].open_ms = 4000;
+
+    SUBCASE("without clear the whole batch is dropped") {
+        series.backfill(refetch, 3);
+        REQUIRE(series.size() == 1);
+        CHECK(series.at(0).open_ms == 1000);  // the hole at 2000..4000 is unfillable
+    }
+
+    SUBCASE("after clear the batch merges") {
+        series.clear();
+        CHECK(series.size() == 0);
+        series.backfill(refetch, 3);
+        REQUIRE(series.size() == 3);
+        CHECK(series.at(0).open_ms == 2000);
+        CHECK(series.at(2).open_ms == 4000);
+    }
+}
+
+TEST_CASE("CandleSeries::clear leaves the series usable for appends") {
+    pc::md::CandleSeries series;
+    pc_candle bar{};
+    bar.open_ms = 1000;
+    series.apply(bar);
+    series.clear();
+
+    // first_/size_ must both be reset, not just size_ -- otherwise the ring appends at a
+    // stale offset and at(0) reads a slot the writer never touched.
+    bar.open_ms = 5000;
+    bar.c = 7;
+    series.apply(bar);
+    REQUIRE(series.size() == 1);
+    CHECK(series.at(0).open_ms == 5000);
+    CHECK(series.at(0).c == 7);
+
+    pc_candle out[4]{};
+    CHECK(series.copy_recent(out, 4) == 1);
+    CHECK(out[0].open_ms == 5000);
+}
+
 TEST_CASE("CandleSeries::copy_recent returns the newest window without tearing") {
     pc::md::CandleSeries series;
     for (uint64_t i = 0; i < 10; ++i) {

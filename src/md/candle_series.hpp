@@ -55,6 +55,16 @@ public:
     void fold_trade(Px px, Qty sz, uint64_t time_ms, uint64_t interval_ms,
                     uint8_t interval_id) noexcept;
 
+    // Engine thread only. Drops every cached candle, returning the series to its cold-start
+    // state. Called when an asset's streams are unsubscribed (a coin switch): what is left
+    // cached at that moment stops being extendable, because backfill() only merges bars
+    // strictly OLDER than the oldest one already held. A series abandoned with old bars in it
+    // therefore rejects the whole of the next REST snapshot -- every bar in it is newer than
+    // that horizon -- and the unsubscribed span becomes a hole no code path can ever fill.
+    // Discarding is the honest option: those bars describe a window the series no longer has
+    // continuous coverage of.
+    void clear() noexcept;
+
     // Engine thread only, no cross-thread guarantee -- for engine-side logic (e.g. deciding
     // whether a timeframe needs a backfill fetch at all).
     [[nodiscard]] size_t size() const noexcept { return size_; }

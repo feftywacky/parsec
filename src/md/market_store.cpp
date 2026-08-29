@@ -102,6 +102,23 @@ void MarketStore::apply(const pc_event& e) noexcept {
     }
 }
 
+void MarketStore::reset_venue_candles(uint32_t asset) noexcept {
+    AssetMarket* market = find_mut(asset);
+    if (market == nullptr)
+        return;
+    for (uint8_t iv = PC_IV_FIRST_VENUE; iv < kIntervalCount; ++iv)
+        market->candles[iv].clear();
+    // A snapshot run for this asset may be half-staged (its PC_F_SNAPSHOT_END not yet drained)
+    // or its reply still in flight. Either way the batch is now for a coin we have
+    // unsubscribed; letting it complete would re-fill the series with bars that stop at the
+    // fetch's `endTime`, recreating exactly the stale horizon this reset exists to remove.
+    if (candle_snapshot_asset_ == asset) {
+        candle_snapshot_.clear();
+        candle_snapshot_asset_ = PC_ASSET_NONE;
+        candle_snapshot_interval_ = 0xFF;
+    }
+}
+
 bool MarketStore::snapshot(uint32_t asset, uint64_t now_ms, const StalenessConfig& cfg,
                            InstrumentSnapshot& out) const noexcept {
     const auto* a = find(asset);

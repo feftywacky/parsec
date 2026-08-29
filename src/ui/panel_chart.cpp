@@ -93,6 +93,35 @@ LevelTag draw_level(ImDrawList* dl, ImVec2 plot_pos, ImVec2 plot_size, double pr
     return LevelTag{y, tag_left, half_h};
 }
 
+// Fills the remaining panel body with a centred spinner and one line of text. Used while a
+// timeframe/instrument switch is waiting on its REST backfill: the alternative the chart used
+// to show was the two or three candles the live feed had folded so far, which reads as a
+// broken chart rather than as "still loading".
+void draw_loading_body(const char* text) noexcept {
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (avail.x <= 0.0F || avail.y <= 0.0F)
+        return;
+    const ImVec2 centre(origin.x + avail.x * 0.5F, origin.y + avail.y * 0.5F - 10.0F);
+
+    // A single sweeping arc rather than the usual dot ring: one path, no per-dot alpha, and it
+    // stays legible at the small radius a panel this size affords.
+    constexpr float kRadius = 13.0F;
+    constexpr float kThickness = 2.5F;
+    const float t = static_cast<float>(ImGui::GetTime());
+    const float start = t * 3.0F;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 col = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+    dl->PathClear();
+    dl->PathArcTo(centre, kRadius, start, start + 3.14159265F * 1.4F, 24);
+    dl->PathStroke(col, ImDrawFlags_None, kThickness);
+
+    const ImVec2 text_size = ImGui::CalcTextSize(text);
+    dl->AddText(ImVec2(centre.x - text_size.x * 0.5F, centre.y + kRadius + 10.0F), col, text);
+    // Claim the space so anything drawn after this does not overlap the spinner.
+    ImGui::Dummy(avail);
+}
+
 }  // namespace
 
 // How many candles the default view frames. Both axes seed against this: X spans this many
@@ -160,10 +189,45 @@ void draw_chart(PanelContext& ctx) {
 
         const md::CandleSeries& series = ctx.market->candles[ctx.view.interval];
         const size_t n = series.copy_recent(g_candle_buf, md::CandleSeries::kCapacity);
+
+        // --- backfill gate --------------------------------------------------------------
+        // Switching coin or timeframe fires a REST candleSnapshot that takes a few hundred ms
+        // to a couple of seconds to land, and until it does the series holds only whatever the
+        // live feed has folded since the subscribe -- one or two candles. Drawing that is
+        // worse than drawing nothing: the chart paints a lone bar, seeds its axes against it,
+        // then visibly rebuilds itself when the history arrives. So hold the spinner until the
+        // series has enough bars to frame the default view.
+        //
+        // Sub-minute timeframes are exempt: they are folded locally from the trades stream and
+        // have no backfill to wait for, so they would spin until the timeout every time and
+        // then show the same one candle anyway.
+        static uint8_t loading_interval = 0xFF;
+        static uint32_t loading_asset = PC_ASSET_NONE;
+        static double loading_since = 0.0;
+        if (loading_interval != ctx.view.interval || loading_asset != ctx.instrument.asset) {
+            loading_interval = ctx.view.interval;
+            loading_asset = ctx.instrument.asset;
+            loading_since = ImGui::GetTime();
+        }
+        // The gate is time-boxed, not open-ended. A thin market (or a timeframe whose whole
+        // history is shorter than kSeedCandles bars) legitimately never reaches the threshold,
+        // and a chart that spins forever is a worse failure than one drawn from short history.
+        constexpr double kBackfillTimeoutS = 4.0;
+        const bool venue_interval = ctx.view.interval >= PC_IV_FIRST_VENUE;
+        if (venue_interval && n < kSeedCandles &&
+            ImGui::GetTime() - loading_since < kBackfillTimeoutS) {
+            char label[64];
+            std::snprintf(label, sizeof(label), "loading %s candles...",
+                          kIntervalLabels[ctx.view.interval]);
+            draw_loading_body(label);
+            ImGui::End();
+            return;
+        }
+
         if (n == 0) {
             // Sub-minute series are folded from live trades and have no history at all, so
             // "nothing yet" is the expected state right after connecting rather than a fault.
-            if (ctx.view.interval < PC_IV_FIRST_VENUE)
+            if (!venue_interval)
                 ImGui::TextDisabled(
                     "%s candles are built from live trades (the venue serves none below 1m) -- "
                     "waiting for the first print.",

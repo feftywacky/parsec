@@ -99,6 +99,14 @@ public:
     bool snapshot(uint32_t asset, uint64_t now_ms, const StalenessConfig& cfg,
                   InstrumentSnapshot& out) const noexcept;
 
+    // Engine thread. Drops the cached candles for every VENUE interval of `asset` (see
+    // CandleSeries::clear() for why abandoning them is not an option), and discards any REST
+    // snapshot run still being staged for it, so a batch whose reply lands after the switch
+    // cannot repopulate the series we just emptied. No-op for an asset that has never received
+    // an event. Sub-minute intervals are left alone: they carry no venue history and are
+    // rebuilt from the trades stream.
+    void reset_venue_candles(uint32_t asset) noexcept;
+
     // Signal 3 (docs/03 §W6): feed the reply of an `exchangeStatus` request here. See
     // md::L1ClockTracker for why this lives account-wide rather than per-asset.
     void note_l1_clock(uint64_t l1_time_ms, uint64_t local_now_ms) noexcept {

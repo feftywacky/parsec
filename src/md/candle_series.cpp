@@ -19,6 +19,20 @@ void CandleSeries::apply(const pc_candle& candle) noexcept {
     generation_.fetch_add(1, std::memory_order_release);  // -> even: stable
 }
 
+void CandleSeries::clear() noexcept {
+    if (size_ == 0)
+        return;
+    // Same odd/even protocol the other mutators use -- a UI-thread copy_recent() may be
+    // mid-flight, and it must see either the full series or an empty one, never a stale
+    // `first_` paired with a zeroed `size_`.
+    generation_.fetch_add(1, std::memory_order_acq_rel);  // -> odd: write in progress
+    std::atomic_signal_fence(std::memory_order_acq_rel);
+    first_ = 0;
+    size_ = 0;
+    std::atomic_signal_fence(std::memory_order_acq_rel);
+    generation_.fetch_add(1, std::memory_order_release);  // -> even: stable
+}
+
 void CandleSeries::backfill(const pc_candle* items, size_t count) noexcept {
     if (count == 0)
         return;
