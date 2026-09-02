@@ -102,6 +102,9 @@ void AppWindow::draw_panels(PanelContext& ctx) {
     draw_funding(ctx);
     draw_order_history(ctx);
     draw_status_bar(ctx);
+
+    // After every panel, so each tab bar's layout is settled (see theme.cpp).
+    draw_tab_underlines();
 }
 
 

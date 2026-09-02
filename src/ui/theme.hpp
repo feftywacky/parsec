@@ -8,6 +8,10 @@ namespace pc::ui {
 // ImGui::CreateContext() and before the first frame.
 void apply_theme();
 
+// Draws the selected-tab marker (a green rule under the tab label) for every tab bar visible
+// this frame. Call once per frame after all panels have been submitted, before ImGui::Render().
+void draw_tab_underlines();
+
 // Named accent colours other panels should reuse rather than hardcoding, so bid/ask/text
 // colouring stays consistent across the book, chart, ticket, and positions panels
 // (docs/05-ui.md, docs/02-architecture.md §7). Palette is the Hyperliquid-style dark teal

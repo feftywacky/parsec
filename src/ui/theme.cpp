@@ -1,3 +1,5 @@
+#include <imgui_internal.h>
+
 #include "ui/theme.hpp"
 
 namespace pc::ui {
@@ -62,6 +64,10 @@ void apply_theme() {
     colors[ImGuiCol_TabActive] = kColorBg;
     colors[ImGuiCol_TabUnfocused] = kColorBg;
     colors[ImGuiCol_TabUnfocusedActive] = kColorBg;
+    // The selected tab is marked by a green rule under the label (drawn in
+    // draw_tab_underlines), not by ImGui's default overline across the top edge.
+    colors[ImGuiCol_TabSelectedOverline] = ImVec4(0.0F, 0.0F, 0.0F, 0.0F);
+    colors[ImGuiCol_TabDimmedSelectedOverline] = ImVec4(0.0F, 0.0F, 0.0F, 0.0F);
     colors[ImGuiCol_DockingPreview] = kActive;
     colors[ImGuiCol_DockingEmptyBg] = kColorBg;
     colors[ImGuiCol_PlotLines] = kColorAccent;
@@ -71,6 +77,48 @@ void apply_theme() {
     colors[ImGuiCol_TableBorderLight] = kBorder;
     colors[ImGuiCol_TableRowBg] = ImVec4(0.0F, 0.0F, 0.0F, 0.0F);
     colors[ImGuiCol_TableRowBgAlt] = ImVec4(0.0F, 0.0F, 0.0F, 0.0F);
+}
+
+
+// Marks the selected tab of every visible tab bar with a green rule along its bottom edge.
+//
+// ImGui has no underline style for tabs -- its own selected-tab marker is the overline across
+// the top edge, which is switched off above. Run this once per frame after all panels have
+// been submitted: by then each tab bar's layout is final, so the selected tab's rect can be
+// read straight off it and the line appended to the host window's draw list (which already
+// holds the tab bar itself, so the line lands on top of it and under any popup).
+void draw_tab_underlines() {
+    ImGuiContext& g = *ImGui::GetCurrentContext();
+    const ImU32 col = ImGui::GetColorU32(kColorAccent);
+
+    auto underline = [&](ImGuiTabBar* tab_bar) {
+        if (tab_bar == nullptr || tab_bar->CurrFrameVisible != g.FrameCount ||
+            tab_bar->Window == nullptr)
+            return;
+        const ImGuiTabItem* tab = ImGui::TabBarFindTabByID(tab_bar, tab_bar->SelectedTabId);
+        if (tab == nullptr || tab->Width <= 0.0F)
+            return;
+
+        const float x0 = tab_bar->BarRect.Min.x + tab->Offset - tab_bar->ScrollingAnim;
+        const float x1 = x0 + tab->Width;
+        const float y = tab_bar->BarRect.Max.y - 1.0F;
+
+        ImDrawList* dl = tab_bar->Window->DrawList;
+        dl->PushClipRect(ImVec2(tab_bar->BarRect.Min.x, tab_bar->BarRect.Min.y),
+                         ImVec2(tab_bar->BarRect.Max.x, tab_bar->BarRect.Max.y + 2.0F), true);
+        dl->AddLine(ImVec2(x0, y), ImVec2(x1, y), col, 1.0F);
+        dl->PopClipRect();
+    };
+
+    // Plain tab bars (BeginTabBar) live in the context pool...
+    for (int n = 0; n < g.TabBars.GetMapSize(); n++)
+        underline(g.TabBars.TryGetMapData(n));
+
+    // ...while a docked panel's tabs belong to its dock node, which owns its tab bar
+    // privately and never registers it in that pool.
+    for (int n = 0; n < g.DockContext.Nodes.Data.Size; n++)
+        if (auto* node = static_cast<ImGuiDockNode*>(g.DockContext.Nodes.Data[n].val_p))
+            underline(node->TabBar);
 }
 
 }  // namespace pc::ui
