@@ -811,10 +811,25 @@ void draw_ticket(PanelContext& ctx) {
     // cost is the ~$0.9k difference. Charging the full notional made the old "Margin required"
     // line agree with the equally inflated `availableToTrade` above -- two wrong numbers whose
     // ratio happened to be right, so the gate passed while both displayed figures were fiction.
+    //
+    // That netting is only true of an order that FILLS, though: the flatten and the open happen
+    // in the same trade, so the freed margin funds the new leg. An order that only RESTS has to
+    // be funded on its own -- the venue holds margin against it while the position it would
+    // close is still open, and releases the position's margin at fill, not at placement. A
+    // resting order that FLIPS the position therefore costs its whole notional over leverage.
+    // Netting it anyway is what let a 9.99 ETH sell resting above the touch, against a small
+    // open ETH long, preview at $2,335 of a $2,587 balance and come back "Insufficient margin
+    // to place order": the venue wanted the gross $2,588, plus the fee.
     Usd margin_required = 0;
     if (!ctx.view.ticket_reduce_only && final_sz > 0) {
         const Qty resulting_abs = resulting_szi < 0 ? -resulting_szi : resulting_szi;
-        const Px margin_px = available_mark > 0 ? available_mark : final_px;
+        // Priced at the worse of the mark and the order's own price. The venue reserves a
+        // resting order's margin at the price it is signed at, so a sell parked above the mark
+        // costs more per unit than the mark implies -- and a buy parked below it costs less,
+        // where the mark is the conservative half. Taking the higher of the two is right in
+        // both directions; pricing purely at the mark under-charged one side of every ticket.
+        const Px mark_px = available_mark > 0 ? available_mark : final_px;
+        const Px margin_px = std::max(mark_px, final_px);
         const Usd resulting_margin = portfolio::initial_margin(
             notional(margin_px, resulting_abs), ctx.view.ticket_leverage);
         // Only margin in the same mode is fungible with the free margin above: an isolated
@@ -827,6 +842,18 @@ void draw_ticket(PanelContext& ctx) {
                 ? current_position->value.margin_used
                 : 0;
         margin_required = std::max<Usd>(0, resulting_margin - released);
+
+        // A resting order that flips the position: charge the gross notional (see above). An
+        // order that only shrinks the position is left alone -- it opens no exposure and the
+        // venue asks nothing for it, whether it rests or crosses.
+        const bool crosses_on_placement = ctx.view.ticket_market || limit_crosses;
+        const bool flips_position =
+            existing_szi != 0 && resulting_szi != 0 &&
+            (existing_szi > 0) != (resulting_szi > 0);
+        if (!crosses_on_placement && flips_position) {
+            margin_required = portfolio::initial_margin(notional(margin_px, final_sz),
+                                                        ctx.view.ticket_leverage);
+        }
     }
     const Usd maintenance_rate =
         portfolio::maintenance_rate_for_max_leverage(max_leverage);
@@ -1070,14 +1097,18 @@ void draw_ticket(PanelContext& ctx) {
     const bool account_blocked = !ctx.portfolio.account_valid;
     const bool account_data_loading = ctx.portfolio.account_valid && !data_for_asset &&
                                       !ctx.view.ticket_reduce_only;
-    // Net new margin against free margin -- both account-level and in the same units.
+    // Net new margin PLUS the opening fee against free margin -- both account-level and in the
+    // same units. The fee comes out of the same collateral the margin does, so an order sized
+    // to the last cent of free margin is short by exactly the fee; leaving it out of the gate
+    // is why a 97%-of-max ticket previewed as fine and came back rejected.
     //
     // `margin_required > 0` keeps an order that needs no new margin -- one that only reduces or
     // flattens -- from ever being blocked on margin. It cannot be the thing that makes the
     // account unsafe, and it is the way out of a fully-committed account.
+    const Usd margin_and_fee = margin_required > 0 ? margin_required + estimated_fee : 0;
     const bool available_blocked = ctx.portfolio.account_valid && !ctx.view.ticket_reduce_only &&
                                    have_price && margin_required > 0 &&
-                                   margin_required > available_margin;
+                                   margin_and_fee > available_margin;
     const bool max_trade_blocked = data_for_asset && !ctx.view.ticket_reduce_only &&
                                    max_trade_qty > 0 && final_sz > max_trade_qty;
     if (account_blocked) {
@@ -1089,7 +1120,7 @@ void draw_ticket(PanelContext& ctx) {
         ImGui::TextColored(kColorWarning, "Loading account limits -- opening orders are paused.");
     } else if (available_blocked) {
         char excess_value[32];
-        format_usd(margin_required - available_margin, excess_value, sizeof(excess_value));
+        format_usd(margin_and_fee - available_margin, excess_value, sizeof(excess_value));
         ImGui::TextColored(kColorAsk, "Blocked: needs %s USDC more margin than is available",
                            excess_value);
     } else if (max_trade_blocked) {
