@@ -5,7 +5,6 @@
 #include "portfolio/collateral.hpp"
 #include "portfolio/live_marks.hpp"
 #include "portfolio/order_preview.hpp"
-#include "portfolio/pnl.hpp"
 #include "ui/app_window.hpp"
 #include "ui/asset_lookup.hpp"
 #include "ui/panels.hpp"
@@ -101,8 +100,18 @@ void draw_balances(PanelContext& ctx) {
     // against mainnet it read $37 while the venue's own `availableToTrade` for the opening
     // side said $1,471, because $1,434 of the balance was simply idle. free_collateral() adds
     // the idle part back; the clamp inside it guards the live re-mark above, not the venue.
-    const Usd available = portfolio::free_collateral(m.account_value, m.withdrawable,
-                                                     ctx.portfolio.spot, ctx.portfolio.spot_valid);
+    //
+    // The account value handed to the undeployed leg is the SNAPSHOT one, not `m`'s re-marked
+    // value, while `withdrawable` is re-marked. That looks inconsistent and is the only
+    // combination that is right: `spot.total` is a snapshot figure the live re-mark cannot
+    // touch, so `spot.total - m.account_value` shrinks by the whole live P&L delta. Pairing the
+    // two re-marked halves made a $100 open gain at 10x LOWER available margin by $10 (and by
+    // the full $100 on an isolated position, whose P&L is not cross collateral at all) when it
+    // should raise it by $90. The engine refreshes both snapshots on one cadence precisely so
+    // their sum does not jitter (src/app/engine.cpp) -- this keeps them on one clock.
+    const Usd available =
+        portfolio::free_collateral(ctx.portfolio.account.account_value, m.withdrawable,
+                                   ctx.portfolio.spot, ctx.portfolio.spot_valid);
     format_usd(available, buf, sizeof(buf));
     ImGui::Text("%-26s", "Available margin");
     ImGui::SameLine();
@@ -118,20 +127,21 @@ void draw_balances(PanelContext& ctx) {
     // position makes it climb without a dollar being banked -- and it falls straight back the
     // moment the mark turns. Sizing off it means sizing off a number that can evaporate, so
     // the cash figure sits underneath it rather than in a tooltip.
-    Usd total_unrealized = 0;
-    Usd total_cost_basis = 0;
-    for (uint32_t i = 0; i < ctx.portfolio.position_count; ++i) {
-        const portfolio::Position& row = ctx.portfolio.positions[i];
-        total_unrealized += row.asset == ctx.instrument.asset && ctx.instrument.ctx.mark_px() > 0
-                                ? portfolio::unrealized_pnl(row.value.szi, row.value.entry_px,
-                                                            ctx.instrument.ctx.mark_px())
-                                : row.value.unrealized_pnl;
-        total_cost_basis += portfolio::position_cost_basis(row.value);
-    }
     if (ctx.portfolio.position_count > 0) {
-        const Usd cash = portfolio::cash_collateral(available, m.account_value, total_unrealized,
-                                                    total_cost_basis, ctx.portfolio.spot,
-                                                    ctx.portfolio.spot_valid);
+        // Snapshot throughout -- account value, unrealized and cost basis all off the same
+        // clearinghouseState. Re-marking only the unrealized leg (which this did) subtracts a
+        // gain the account value has not been credited with yet, and the "cash" line then fell
+        // dollar for dollar as the position won: the one thing it is defined not to do.
+        Usd total_unrealized = 0;
+        Usd total_cost_basis = 0;
+        for (uint32_t i = 0; i < ctx.portfolio.position_count; ++i) {
+            const portfolio::Position& row = ctx.portfolio.positions[i];
+            total_unrealized += row.value.unrealized_pnl;
+            total_cost_basis += portfolio::position_cost_basis(row.value);
+        }
+        const Usd cash = portfolio::cash_collateral(
+            available, ctx.portfolio.account.account_value, total_unrealized, total_cost_basis,
+            ctx.portfolio.spot, ctx.portfolio.spot_valid);
         format_usd(cash, buf, sizeof(buf));
         ImGui::Text("%-26s", "USDC available (cash)");
         ImGui::SameLine();

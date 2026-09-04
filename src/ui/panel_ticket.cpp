@@ -8,7 +8,6 @@
 #include "exec/slippage.hpp"
 #include "portfolio/collateral.hpp"
 #include "portfolio/order_preview.hpp"
-#include "portfolio/pnl.hpp"
 #include "ui/app_window.hpp"
 #include "ui/cloid.hpp"
 #include "ui/panels.hpp"
@@ -804,55 +803,73 @@ void draw_ticket(PanelContext& ctx) {
             preview_entry = current_position->value.entry_px;
     }
 
-    // The margin this order actually costs, which is the margin on the position it LEAVES
-    // BEHIND minus the margin already posted against the position it trades through -- not the
-    // full order notional over leverage. Buying 1.6 BTC against a 0.75 BTC short does not need
-    // $12.7k: it flattens the short (freeing its $5.9k) and leaves a 0.86 BTC long, so its real
-    // cost is the ~$0.9k difference. Charging the full notional made the old "Margin required"
-    // line agree with the equally inflated `availableToTrade` above -- two wrong numbers whose
-    // ratio happened to be right, so the gate passed while both displayed figures were fiction.
-    //
-    // That netting is only true of an order that FILLS, though: the flatten and the open happen
-    // in the same trade, so the freed margin funds the new leg. An order that only RESTS has to
-    // be funded on its own -- the venue holds margin against it while the position it would
-    // close is still open, and releases the position's margin at fill, not at placement. A
-    // resting order that FLIPS the position therefore costs its whole notional over leverage.
-    // Netting it anyway is what let a 9.99 ETH sell resting above the touch, against a small
-    // open ETH long, preview at $2,335 of a $2,587 balance and come back "Insufficient margin
-    // to place order": the venue wanted the gross $2,588, plus the fee.
+    // The margin this order actually costs. The two cases below are genuinely different
+    // accounting and must not share a formula: an order that FILLS on placement nets against
+    // the position it trades through (the flatten and the open happen in the same trade, so the
+    // freed margin funds the new leg), while an order that only RESTS is funded on its own, at
+    // its own signed price, because the venue holds margin against it while the position it
+    // would close is still open and releases that position's margin at fill, not at placement.
     Usd margin_required = 0;
     if (!ctx.view.ticket_reduce_only && final_sz > 0) {
         const Qty resulting_abs = resulting_szi < 0 ? -resulting_szi : resulting_szi;
-        // Priced at the worse of the mark and the order's own price. The venue reserves a
-        // resting order's margin at the price it is signed at, so a sell parked above the mark
-        // costs more per unit than the mark implies -- and a buy parked below it costs less,
-        // where the mark is the conservative half. Taking the higher of the two is right in
-        // both directions; pricing purely at the mark under-charged one side of every ticket.
+        const Qty existing_abs = existing_szi < 0 ? -existing_szi : existing_szi;
         const Px mark_px = available_mark > 0 ? available_mark : final_px;
-        const Px margin_px = std::max(mark_px, final_px);
-        const Usd resulting_margin = portfolio::initial_margin(
-            notional(margin_px, resulting_abs), ctx.view.ticket_leverage);
-        // Only margin in the same mode is fungible with the free margin above: an isolated
-        // position's margin is not part of the cross pool, so releasing it does not fund a
-        // cross order. When the modes disagree, charge the order in full rather than promise
-        // an offset the venue will not give.
-        const Usd released =
-            current_position && existing_szi != 0 &&
-                    (current_position->value.is_cross != 0) == ctx.view.ticket_cross
-                ? current_position->value.margin_used
-                : 0;
-        margin_required = std::max<Usd>(0, resulting_margin - released);
-
-        // A resting order that flips the position: charge the gross notional (see above). An
-        // order that only shrinks the position is left alone -- it opens no exposure and the
-        // venue asks nothing for it, whether it rests or crosses.
         const bool crosses_on_placement = ctx.view.ticket_market || limit_crosses;
-        const bool flips_position =
-            existing_szi != 0 && resulting_szi != 0 &&
-            (existing_szi > 0) != (resulting_szi > 0);
-        if (!crosses_on_placement && flips_position) {
-            margin_required = portfolio::initial_margin(notional(margin_px, final_sz),
-                                                        ctx.view.ticket_leverage);
+        // An order that only shrinks the position opens no exposure, so the venue asks nothing
+        // for it whether it rests or crosses. [MEASURED] on mainnet against public accounts:
+        // 0x8469d67d holds a 1.12023 BTC cross short at 10x with one resting, NON-reduce-only
+        // buy of 0.1 @ 79234 -- the only live order on the account -- and the venue's order
+        // hold on it is exactly $0.00, not the $792.34 the gross notional would cost. Four
+        // more accounts (0x639c8d87, 0xc984e1f0, 0x230ff1ab, 0x5233199f) quote both sides
+        // around a position and are charged for the opening side alone, to the cent. The
+        // hold is read as `accountValue - SUM(positionValue / min(leverage, 10)) -
+        // withdrawable`; see docs/09 for why that denominator is 10 and not the leverage.
+        const bool only_reduces = existing_szi != 0 &&
+                                  (existing_szi > 0) != (signed_order_szi > 0) &&
+                                  final_sz <= existing_abs;
+
+        if (!crosses_on_placement) {
+            // A RESTING order is funded on its own, at the price it is SIGNED at -- the venue
+            // holds margin against it while the position it would trade through is still open,
+            // and releases that position's margin at fill, not at placement. So no netting, and
+            // `final_px` rather than the mark: pricing a resting order at the mark under-charged
+            // a sell parked above it (a 9.99 ETH sell against a small ETH long previewed at
+            // $2,335 of a $2,587 balance and came back "Insufficient margin"; the venue wanted
+            // the gross $2,588 plus the fee) and over-charged a bid parked below it, which
+            // blocked orders the venue would have accepted.
+            // `final_px` falls back to the mark only when the price field is empty: a limit
+            // order with no price typed is not blocked locally (see `submit_blocked`), and
+            // pricing it at zero would quietly pass the gate on any size.
+            const Px resting_px = final_px > 0 ? final_px : mark_px;
+            margin_required =
+                only_reduces ? 0
+                             : portfolio::initial_margin(notional(resting_px, final_sz),
+                                                         ctx.view.ticket_leverage);
+        } else {
+            // An order that FILLS on placement costs the margin on the position it LEAVES
+            // BEHIND minus the margin already posted against the position it trades through --
+            // not the full order notional over leverage. Buying 1.6 BTC against a 0.75 BTC short
+            // does not need $12.7k: it flattens the short (freeing its $5.9k) and leaves a 0.86
+            // BTC long, so its real cost is the ~$0.9k difference. Charging the full notional
+            // made the old "Margin required" line agree with the equally inflated
+            // `availableToTrade` above -- two wrong numbers whose ratio happened to be right, so
+            // the gate passed while both displayed figures were fiction.
+            //
+            // Both legs priced at the MARK, because `released` (the venue's `margin_used`) is a
+            // mark-priced figure: netting a limit-priced requirement against it inflated the
+            // answer by the price gap times the existing size over leverage.
+            const Usd resulting_margin = portfolio::initial_margin(
+                notional(mark_px, resulting_abs), ctx.view.ticket_leverage);
+            // Only margin in the same mode is fungible with the free margin above: an isolated
+            // position's margin is not part of the cross pool, so releasing it does not fund a
+            // cross order. When the modes disagree, charge the order in full rather than promise
+            // an offset the venue will not give.
+            const Usd released =
+                current_position && existing_szi != 0 &&
+                        (current_position->value.is_cross != 0) == ctx.view.ticket_cross
+                    ? current_position->value.margin_used
+                    : 0;
+            margin_required = std::max<Usd>(0, resulting_margin - released);
         }
     }
     const Usd maintenance_rate =
@@ -999,15 +1016,16 @@ void draw_ticket(PanelContext& ctx) {
         // when the mark turns. Only shown with positions open; flat, the two are the same
         // number and printing it twice would suggest they are not.
         if (ctx.portfolio.account_valid && ctx.portfolio.position_count > 0) {
+            // Every input here is the SAME clearinghouseState snapshot: the account value, the
+            // per-position unrealized and the cost basis. Re-marking the unrealized leg to the
+            // live mark while `account_value` stays at the snapshot subtracts a number the
+            // account value has not been credited with yet, so the line moved down dollar for
+            // dollar with an open gain -- the exact mark-dependence it exists to remove.
             Usd open_unrealized = 0;
             Usd open_cost_basis = 0;
             for (uint32_t i = 0; i < ctx.portfolio.position_count; ++i) {
                 const portfolio::Position& row = ctx.portfolio.positions[i];
-                open_unrealized +=
-                    row.asset == ctx.instrument.asset && available_mark > 0
-                        ? portfolio::unrealized_pnl(row.value.szi, row.value.entry_px,
-                                                    available_mark)
-                        : row.value.unrealized_pnl;
+                open_unrealized += row.value.unrealized_pnl;
                 open_cost_basis += portfolio::position_cost_basis(row.value);
             }
             char cash_buf[32], cash_row[64];

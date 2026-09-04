@@ -168,3 +168,88 @@ The capture client is a dependency-free raw WebSocket implementation; no `websoc
 `tests/fixtures/info/` for the REST captures. Re-run the cadence measurement whenever the
 deployment's network vantage point changes — per §1.3, the numbers are a property of the
 *venue's activity as seen from here*, not of the venue alone.
+
+---
+
+## 5. Margin accounting — what `withdrawable` actually is, and what a resting order costs
+
+Captured 2026-09-03 against mainnet `POST /info`, read-only, over ~470 public accounts drawn
+from the public leaderboard (`https://stats-data.hyperliquid.xyz/Mainnet/leaderboard`). No
+orders were placed. Each account was pulled as `clearinghouseState` + `frontendOpenOrders`
+(+ `spotClearinghouseState` / `activeAssetData` where noted) back to back.
+
+### 5.1 `withdrawable` floors effective leverage at 10x — it is NOT `accountValue - totalMarginUsed`
+
+    withdrawable = accountValue - SUM_i positionValue_i / min(leverage_i, 10)
+
+Exact on every account tested with a cross position above 10x and no resting orders — 7/7 in
+a targeted scan at leverages 15/20/25/40, plus 4 found earlier:
+
+| account | leverages | `withdrawable` | `AV - totalMarginUsed` | formula above |
+|---|---|---|---|---|
+| `0x30b16c4e` | 40, 10, 6 | 1,104.09 | 2,363.24 | **1,104.09** |
+| `0x5e3b1ec0` | 20, 15, 20 | 2,002.10 | 15,570.86 | **2,002.10** |
+| `0x7662b2c3` | 20 | 506.25 | 21,089.52 | **506.25** |
+| `0x812ee6a9` | 40, 25, 10, 10 | 188.12 | 5,365.50 | **188.12** |
+| `0x683ca63e` | 20, 10, 5, 10 | 2,317.94 | 2,899.97 | **2,317.94** |
+| `0x8be2bc17` | 20, 10 | 70,604.87 | 71,106.23 | **70,604.87** |
+| `0xbe494a5e` | 20, 10 | 211.76 | 211.97 | **211.76** |
+
+`totalMarginUsed` is `positionValue / leverage` and tracks the leverage the position was
+opened at; `withdrawable` charges the same position again at 10x whenever the account is
+levered past that. At or below 10x the two coincide, which is why §03's original measurement
+(a **10x** short) agreed and this was never visible.
+
+### 5.2 The venue's own order capacity uses the real leverage
+
+`activeAssetData.availableToTrade` on the **opening** side, against accounts with no resting
+orders — exact to the cent, and it is the `AV - totalMarginUsed` column, not `withdrawable`:
+
+| account | lev | venue `availableToTrade` | `withdrawable + idle` | `AV - totalMarginUsed + idle` |
+|---|---|---|---|---|
+| `0xefc1aaf1` | 15 | 22,682.78 | 16,181.63 | **22,682.80** |
+| `0x553f4589` | 27 | 48,352.26 | 36,515.86 | **48,352.29** |
+| `0x8fbd8f15` | 20 | 2.71 | 2.09 | **2.74** |
+
+**Consequence for parsec:** `free_collateral()` is built on `withdrawable`, so it under-states
+buying power by `SUM_i positionValue_i * (1/10 - 1/leverage_i)` for any position above 10x —
+29% of the venue's own answer on `0xefc1aaf1`, 24% on `0x553f4589`. This is the same class of
+bug the function was written to fix, one level down.
+
+**Not yet safe to correct.** Adding that term back reproduces `availableToTrade` on accounts
+with no resting orders, but on the two accounts found carrying both >10x leverage *and* live
+orders the venue's figure sits *between* `withdrawable + idle` and the corrected value
+(`0x725c9df2`: venue 1,737.09 vs 863.59 and 2,469.08; `0x815bbac9`: venue 79,658.99 vs
+57,211.52 and 84,158.82). `availableToTrade` evidently nets open-order margin **per side**,
+and that rule is not pinned down here. Fixing the 10x floor without it would trade a
+conservative error for an unbounded one.
+
+### 5.3 A resting non-reduce-only order that only SHRINKS a position costs nothing
+
+Reading the order hold as `accountValue - SUM_i positionValue_i / min(leverage_i, 10) -
+withdrawable` (§5.1), on accounts whose whole live order set is known:
+
+- **`0x8469d67d`** — 1.12023 BTC cross short at 10x, one live order: a **non**-reduce-only
+  resting BUY of 0.1 @ 79,234. Hold: **$0.00**. Gross would be $792.34.
+- **`0x639c8d87`** — 96.95 HYPE long at 2x; 7 buys (opening) and 3 sells (reducing), none
+  reduce-only. Hold **$1,750.1476**, which is the buy side alone, summed at each order's own
+  limit price, over leverage — to four decimals. The three sells cost nothing.
+- **`0xc984e1f0`** — 35,000 LIT short at 5x; one buy (reducing) 1,000 @ 4.0536, one sell
+  (opening) 1,000 @ 4.9752. Hold **$995.04** = the sell alone. The buy's $810.72 is not charged.
+- **`0x230ff1ab`**, **`0x5233199f`** — same shape across 3 and 5 coins; hold equals the opening
+  side of every pair, to the cent.
+
+Two further properties fall out of the same fits:
+
+1. **Order margin is priced at the order's own limit price, not the mark.** `0x639c8d87`'s
+   $1,750.1476 is exact at the limit prices (78.8–85.0); the mark would need to be 80.5
+   against a mid of 85.496.
+2. **It is the MAX of the two sides, not the sum.** `0xb7e09a94` quotes both sides on 7 coins
+   while essentially flat: max-per-side fits its $1,159,964.115 hold with **zero** error and
+   recovers plausible per-coin leverages — including PUMP at 10x, which its open position
+   independently confirms. Summing both sides has no consistent solution.
+
+parsec charges nothing for a reducing resting order (`panel_ticket.cpp`), which §5.3
+confirms, and prices resting orders at `final_px`, which the first property confirms. It does
+not model existing resting orders at all, so a ticket priced while other orders rest
+over-states what is available by their hold.
