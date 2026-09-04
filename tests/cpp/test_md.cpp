@@ -26,7 +26,7 @@ TEST_CASE("L2Book exposes exch_time_ms for staleness checks") {
     CHECK(book.exch_time_ms() == 12345);
 }
 
-TEST_CASE("CandleSeries::backfill prepends only strictly-older history and keeps live data") {
+TEST_CASE("CandleSeries::backfill merges history and keeps live data on overlap") {
     pc::md::CandleSeries series;
     pc_candle live{};
     live.open_ms = 300;
@@ -47,39 +47,56 @@ TEST_CASE("CandleSeries::backfill prepends only strictly-older history and keeps
     CHECK(series.at(2).c == 42);  // untouched by the overlapping backfill entry
 }
 
+TEST_CASE("CandleSeries::backfill fills the interior hole a disconnect leaves") {
+    // The laptop-sleep path. The socket drops mid-session, the candle stream resumes at the
+    // present, and apply() appends that live bar straight after the pre-sleep one -- leaving a
+    // hole whose bars are all NEWER than the oldest cached bar. The reconnect re-fetch spans
+    // the hole, and merging it (rather than only prepending strictly-older bars) is what
+    // actually renders the missing candles.
+    pc::md::CandleSeries series;
+    pc_candle bar{};
+    bar.open_ms = 1000;
+    bar.c = 7;
+    series.apply(bar);
+    bar.open_ms = 5000;  // first bar after waking up
+    bar.c = 9;
+    series.apply(bar);
+    REQUIRE(series.size() == 2);
+
+    pc_candle refetch[5]{};
+    for (size_t k = 0; k < 5; ++k)
+        refetch[k].open_ms = 1000 * (k + 1);
+    refetch[4].c = 999;  // stale REST copy of the live bar
+    series.backfill(refetch, 5);
+
+    REQUIRE(series.size() == 5);
+    for (size_t k = 0; k < 5; ++k)
+        CHECK(series.at(k).open_ms == 1000 * (k + 1));
+    CHECK(series.at(0).c == 7);  // cached bars win on overlap...
+    CHECK(series.at(4).c == 9);  // ...at both ends of the hole
+}
+
 TEST_CASE("CandleSeries::clear lets a re-fetch land after the series is abandoned") {
-    // The coin-switch path. A series left holding bars from before the unsubscribe sets
-    // backfill()'s horizon to those bars, and the next REST snapshot -- which spans up to
-    // *now* and is therefore entirely newer than that horizon -- is rejected wholesale,
-    // leaving the unsubscribed span as a permanent hole. clear() is what makes the return a
-    // genuine cold start.
+    // The coin-switch path. Bars cached from before the unsubscribe describe a different
+    // instrument, so merging the next snapshot into them would splice two coins' candles into
+    // one series. clear() is what makes the return a genuine cold start.
     pc::md::CandleSeries series;
     pc_candle stale{};
     stale.open_ms = 1000;  // cached just before the coin was switched away
     stale.c = 42;
     series.apply(stale);
 
-    // Coming back later: the snapshot covers the gap and the present, all of it newer than
-    // the stale bar's open_ms.
     pc_candle refetch[3]{};
     refetch[0].open_ms = 2000;
     refetch[1].open_ms = 3000;
     refetch[2].open_ms = 4000;
 
-    SUBCASE("without clear the whole batch is dropped") {
-        series.backfill(refetch, 3);
-        REQUIRE(series.size() == 1);
-        CHECK(series.at(0).open_ms == 1000);  // the hole at 2000..4000 is unfillable
-    }
-
-    SUBCASE("after clear the batch merges") {
-        series.clear();
-        CHECK(series.size() == 0);
-        series.backfill(refetch, 3);
-        REQUIRE(series.size() == 3);
-        CHECK(series.at(0).open_ms == 2000);
-        CHECK(series.at(2).open_ms == 4000);
-    }
+    series.clear();
+    CHECK(series.size() == 0);
+    series.backfill(refetch, 3);
+    REQUIRE(series.size() == 3);
+    CHECK(series.at(0).open_ms == 2000);
+    CHECK(series.at(2).open_ms == 4000);
 }
 
 TEST_CASE("CandleSeries::clear leaves the series usable for appends") {

@@ -201,12 +201,12 @@ void Engine::select_asset(uint32_t asset, uint8_t interval) noexcept {
                 if (subscribed_intervals_ & (1ull << iv))
                     pc_unsubscribe(ffi_, active_coin_, PC_STREAM_CANDLE, iv);
             }
-            // Nothing extends these series from here: the candle streams are gone and, since
-            // subscribed_intervals_ resets below, coming back re-fetches from scratch -- but
-            // CandleSeries::backfill() merges only bars strictly older than the oldest one
-            // held, so a series still holding today's bars silently rejects that entire
-            // snapshot and keeps a hole where the unsubscribed span was. Drop them and let the
-            // return path be a real cold start (the chart shows its loading state for it).
+            // Nothing extends these series from here: the candle streams are gone. Unlike a
+            // reconnect gap -- which CandleSeries::backfill() stitches shut on the re-fetch --
+            // what is cached here belongs to the coin being switched AWAY from, and this
+            // series is about to be reused for the next one, so merging a snapshot into it
+            // would splice two instruments' bars together. Drop them and let the return path
+            // be a real cold start (the chart shows its loading state for it).
             markets_.reset_venue_candles(previous);
         }
         std::snprintf(active_coin_, sizeof(active_coin_), "%s", name);

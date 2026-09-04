@@ -36,24 +36,58 @@ void CandleSeries::clear() noexcept {
 void CandleSeries::backfill(const pc_candle* items, size_t count) noexcept {
     if (count == 0)
         return;
-    const uint64_t horizon = size_ ? at(0).open_ms : UINT64_MAX;
-    // items[0..i) are strictly older than what's already cached (ascending, per REST order).
-    size_t i = count;
-    while (i > 0 && items[i - 1].open_ms >= horizon)
-        --i;
-    if (i == 0)
-        return;
+
+    // Full ascending merge of `items` into the cached series, newest-first into `scratch` so
+    // the walk can stop as soon as kCapacity bars are picked. A prepend-only merge (all that
+    // was needed for the cold-start case) cannot repair an INTERIOR hole, and holes are the
+    // normal outcome of a laptop sleeping: the socket drops, the venue's candle stream resumes
+    // at the present, apply() appends that live bar straight after the pre-sleep one, and every
+    // bar covering the sleep sits at an open_ms *newer* than the oldest cached bar -- exactly
+    // the range an older-only merge discards. The re-arm on reconnect (app::Engine's PC_EV_CONN
+    // arm) already re-fetches the snapshot that spans the hole; merging it is what makes the
+    // re-fetch mean anything.
+    //
+    // Cached bars win ties: a live bar (or the in-progress bucket apply() keeps rewriting) is
+    // always at least as fresh as the same bar out of a REST snapshot that may have been in
+    // flight for a while.
+    //
+    // 312 KB is far too large for the stack, and a per-series member would multiply it by every
+    // (asset, interval) pair; backfill() is engine-thread only (see the header's cross-thread
+    // contract), so one buffer per thread is enough.
+    static thread_local std::array<pc_candle, kCapacity> scratch;
+
+    size_t i = size_;  // cached bars [0, i) still to consider, ascending
+    size_t j = count;  // REST bars   [0, j) still to consider, ascending
+    size_t n = 0;      // bars picked so far, filled from the back of `scratch`
+    while (n < kCapacity && (i > 0 || j > 0)) {
+        const pc_candle* pick;
+        if (i > 0 && j > 0) {
+            const uint64_t cached_open = at(i - 1).open_ms;
+            const uint64_t rest_open = items[j - 1].open_ms;
+            if (cached_open >= rest_open) {
+                if (cached_open == rest_open)
+                    --j;  // same bucket from both sources -- drop the REST copy
+                pick = &at(--i);
+            } else {
+                pick = &items[--j];
+            }
+        } else if (i > 0) {
+            pick = &at(--i);
+        } else {
+            pick = &items[--j];
+        }
+        scratch[kCapacity - 1 - n] = *pick;
+        ++n;
+    }
+    if (n == size_ && j == 0 && i == 0)
+        return;  // the snapshot added nothing -- don't churn the generation counter
+
     generation_.fetch_add(1, std::memory_order_acq_rel);
     std::atomic_signal_fence(std::memory_order_acq_rel);
-    // Prepend from the newest of the old range down to the oldest, so the final order stays
-    // ascending: items[i-1] lands immediately before `horizon`, items[0] ends up at the front.
-    for (size_t j = i; j > 0; --j) {
-        if (size_ >= kCapacity)
-            break;  // already holding kCapacity recent candles; older history isn't kept
-        first_ = (first_ + kCapacity - 1) % kCapacity;
-        values_[first_] = items[j - 1];
-        ++size_;
-    }
+    for (size_t k = 0; k < n; ++k)
+        values_[k] = scratch[kCapacity - n + k];
+    first_ = 0;
+    size_ = n;
     std::atomic_signal_fence(std::memory_order_acq_rel);
     generation_.fetch_add(1, std::memory_order_release);
 }

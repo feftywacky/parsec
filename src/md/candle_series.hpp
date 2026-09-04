@@ -34,12 +34,15 @@ public:
     void apply(const pc_candle& candle) noexcept;
 
     // Engine thread only. Merges REST `candleSnapshot` history (docs/03 §`candleSnapshot`,
-    // max 5000 candles) that is strictly older than whatever is already cached, so switching
-    // to a timeframe that has already been streaming live never loses data to a backfill
-    // response that lands late (docs/07 Phase 2: "timeframe switching must not discard cached
-    // data"). `items` must be ascending by `open_ms`, matching the REST response order;
-    // anything at or after the current oldest cached candle is ignored, since apply() already
-    // owns that range and a live tick must never be clobbered by stale REST data.
+    // max 5000 candles) into the cached series, keeping the newest kCapacity bars. `items`
+    // must be ascending by `open_ms`, matching the REST response order. The merge is a full
+    // one, not a prepend: it fills holes anywhere in the series, including the interior hole a
+    // laptop sleeping leaves behind (socket drops, the stream resumes at the present, and the
+    // bars covering the sleep are newer than the oldest cached bar). Where both sources hold
+    // the same bucket the cached bar wins, so a live tick is never clobbered by stale REST
+    // data, and switching to a timeframe that has already been streaming live never loses data
+    // to a backfill response that lands late (docs/07 Phase 2: "timeframe switching must not
+    // discard cached data").
     void backfill(const pc_candle* items, size_t count) noexcept;
 
     // Engine thread only. Folds one trade print into the bucket it belongs to, opening a new
@@ -57,12 +60,10 @@ public:
 
     // Engine thread only. Drops every cached candle, returning the series to its cold-start
     // state. Called when an asset's streams are unsubscribed (a coin switch): what is left
-    // cached at that moment stops being extendable, because backfill() only merges bars
-    // strictly OLDER than the oldest one already held. A series abandoned with old bars in it
-    // therefore rejects the whole of the next REST snapshot -- every bar in it is newer than
-    // that horizon -- and the unsubscribed span becomes a hole no code path can ever fill.
-    // Discarding is the honest option: those bars describe a window the series no longer has
-    // continuous coverage of.
+    // cached at that moment describes a window the series will no longer have continuous
+    // coverage of, and -- unlike a reconnect gap, which backfill() now stitches shut -- it
+    // belongs to a different coin entirely, so merging the next snapshot into it would splice
+    // two instruments' bars into one series.
     void clear() noexcept;
 
     // Engine thread only, no cross-thread guarantee -- for engine-side logic (e.g. deciding
