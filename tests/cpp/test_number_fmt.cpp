@@ -161,3 +161,34 @@ TEST_CASE("format_usd_fine keeps sub-cent amounts visible") {
           "$1,234.50");
     CHECK(std::string(format_usd_fine(0, buf, sizeof(buf))) == "$0.00");
 }
+
+TEST_CASE("format_count groups a plain integer") {
+    char buf[64];
+    CHECK(eq(format_count(0, buf, sizeof(buf)), "0"));
+    CHECK(eq(format_count(999, buf, sizeof(buf)), "999"));
+    CHECK(eq(format_count(1000, buf, sizeof(buf)), "1,000"));
+    CHECK(eq(format_count(-1234567, buf, sizeof(buf)), "-1,234,567"));
+    CHECK(eq(format_count(2262, buf, sizeof(buf)), "2,262"));
+    // INT64_MIN has no positive counterpart; negating it directly is UB.
+    CHECK(eq(format_count(std::numeric_limits<int64_t>::min(), buf, sizeof(buf)),
+             "-9,223,372,036,854,775,808"));
+    // Truncates rather than overflowing a short buffer.
+    char small[4];
+    format_count(1234567, small, sizeof(small));
+    CHECK(std::strlen(small) == 3);
+}
+
+TEST_CASE("format_duration keeps two components at most") {
+    char buf[32];
+    CHECK(eq(format_duration(0, buf, sizeof(buf)), "0s"));
+    CHECK(eq(format_duration(45'000, buf, sizeof(buf)), "45s"));
+    CHECK(eq(format_duration(45 * 60'000, buf, sizeof(buf)), "45m"));
+    CHECK(eq(format_duration(45 * 60'000 + 30'000, buf, sizeof(buf)), "45m 30s"));
+    CHECK(eq(format_duration(6 * 3'600'000 + 45 * 60'000, buf, sizeof(buf)), "6h 45m"));
+    // A whole number of hours drops the empty minutes rather than printing "6h 0m".
+    CHECK(eq(format_duration(6 * 3'600'000, buf, sizeof(buf)), "6h"));
+    CHECK(eq(format_duration(3 * 86'400'000 + 4 * 3'600'000, buf, sizeof(buf)), "3d 4h"));
+    CHECK(eq(format_duration(3 * 86'400'000, buf, sizeof(buf)), "3d"));
+    // Seconds are the finest component: sub-second spans read as 0s, not as an empty string.
+    CHECK(eq(format_duration(500, buf, sizeof(buf)), "0s"));
+}

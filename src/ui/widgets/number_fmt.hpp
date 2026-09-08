@@ -26,6 +26,12 @@ namespace pc::ui {
 // decimals to show.)
 const char* format_px(Px value, uint8_t sz_decimals, char* out, size_t cap) noexcept;
 
+// Formats a Px at exactly `decimals` decimal places. For the chart's price axis, whose labels
+// are spaced by a chosen step rather than by the venue's precision: printing an axis at full
+// venue precision buries the digit that actually changes between two gridlines in a row of
+// trailing zeros.
+const char* format_px_decimals(Px value, int decimals, char* out, size_t cap) noexcept;
+
 // Formats a Qty at exactly `sz_decimals` decimal places (docs/07 Phase 2: "sizes at
 // szDecimals").
 const char* format_qty(Qty value, uint8_t sz_decimals, char* out, size_t cap) noexcept;
@@ -45,6 +51,15 @@ const char* format_usd(Usd value, char* out, size_t cap) noexcept;
 const char* format_usd_fine(Usd value, char* out, size_t cap) noexcept;
 
 const char* format_pct(int64_t value_1e8, int decimals, char* out, size_t cap) noexcept;
+
+// Formats a plain integer with thousands separators, e.g. -1234567 -> "-1,234,567". For counts
+// rather than money: the chart ruler's tick count, bar counts, print counts.
+const char* format_count(int64_t value, char* out, size_t cap) noexcept;
+
+// Formats a duration as at most two components, largest first, dropping the second when it is
+// zero: "6h 45m", "3d 4h", "45m", "12s". A span is read for its magnitude, and "6h 45m 12s"
+// is three numbers to get one of them.
+const char* format_duration(uint64_t ms, char* out, size_t cap) noexcept;
 
 // Formats a unix-millisecond timestamp as "M/D/YYYY - HH:MM:SS" in the viewer's LOCAL time.
 // Local, not UTC, unlike the chart's time axis: an axis is read against other axes and market

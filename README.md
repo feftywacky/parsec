@@ -26,7 +26,7 @@ Run the checks with `cargo test` from `rust/` and `ctest --test-dir build`.
 | 02 | [Architecture](docs/02-architecture.md) | process/thread topology, FFI contract, C++ modules |
 | 03 | [Hyperliquid API](docs/03-hyperliquid-api.md) | verified exchange facts: REST, WebSocket, signing, limits |
 | 04 | [Rust layer](docs/04-rust-layer.md) | transport, codec, signer, the C ABI header |
-| 05 | [UI](docs/05-ui.md) | ImGui/ImPlot layout, chart and book rendering |
+| 05 | [UI](docs/05-ui.md) | ImGui layout, chart and book rendering |
 | 06 | [Security](docs/06-security.md) | key custody, agent wallets, keystore, threat model |
 | 07 | [Implementation plan](docs/07-implementation-plan.md) | phased build order with acceptance criteria |
 | 08 | [Testing](docs/08-testing.md) | unit, signing-vector, replay, and testnet strategy |

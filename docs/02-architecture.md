@@ -17,7 +17,7 @@ Nothing crosses the boundary except POD structs with fixed-size fields and integ
 ┌──────────────────────────────── parsec (one process) ────────────────────────────────┐
 │                                                                                      │
 │  ┌─── UI thread (main) ────────┐   ┌─── Engine thread ─────┐   ┌─ Rust I/O (tokio) ─┐│
-│  │ GLFW + Dear ImGui + ImPlot  │   │ book / positions      │   │ ws mgr (reconnect) ││
+│  │ GLFW + Dear ImGui           │   │ book / positions      │   │ ws mgr (reconnect) ││
 │  │ 60 fps, event-driven        │   │ order state machine   │   │ http client        ││
 │  │                             │   │ risk + rounding       │   │ signer (keystore)  ││
 │  │  reads  ── Seqlock ─────────┼──▶│                       │◀──┼── pc_poll() drains ││
@@ -52,8 +52,8 @@ crossed by exactly one lock-free structure, chosen by access pattern:
 
 ## 2. Numeric model
 
-**No floating point anywhere in the trading path.** Doubles appear only in ImGui/ImPlot
-draw calls and in the last conversion before display.
+**No floating point anywhere in the trading path.** Doubles appear only in ImGui draw
+calls and in the last conversion before display.
 
 ```cpp
 // core/units.hpp
@@ -90,7 +90,7 @@ C++ side never sees a string price or a `double`.
 parsec/
 ├── CMakeLists.txt              # top level: options, deps, corrosion, targets
 ├── cmake/
-│   └── Dependencies.cmake      # FetchContent: imgui, implot, glfw, doctest, ...
+│   └── Dependencies.cmake      # FetchContent: imgui, glfw, json, doctest, corrosion
 ├── docs/                       # this doc set
 ├── rust/
 │   ├── Cargo.toml              # crate-type = ["staticlib"]
@@ -460,7 +460,7 @@ Layout mirrors the reference screenshot, as a single ImGui dockspace:
 │ instrument strip: BTC ETH SOL HYPE …  |  mark  oracle  24h Δ  24h vol  OI  funding  │
 ├──────────────────────────────────────────────┬──────────────┬──────────────────────┤
 │                                              │  Order Book  │  Order Ticket        │
-│   Chart (ImPlot candlesticks + volume)       │  ┌─ asks ─┐  │  Isolated | 3x | ...  │
+│   Chart (candlesticks + volume)             │  ┌─ asks ─┐  │  Isolated | 3x | ...  │
 │   1m 5m 15m 1h 4h D  ·  log/linear           │  │ depth  │  │  Market | Limit      │
 │   overlays: position entry, liq px,          │  └────────┘  │  Buy/Long Sell/Short │
 │             resting orders, TP/SL            │   spread     │  size + % slider     │
@@ -484,9 +484,10 @@ holds state beyond view preferences. Interaction rules worth fixing early:
   — the ticket previews the *rounded* price and size before you can click Buy, so what you
   see is what gets signed.
 
-Rendering the chart: candles are drawn with `ImDrawList` primitives inside an ImPlot axis
-frame, clipped to the visible x-range, so a 50 000-candle series costs the same as a
-200-candle one. (Details and the ImPlot-vs-hand-rolled tradeoff live in `05-ui.md`.)
+Rendering the chart: the whole widget is hand-rolled on `ImDrawList` over a **bar-index** x
+axis, not a time axis, so gaps collapse and zoom is pixels-per-bar. Bounding bar spacing below
+at 1 px bounds the draw loop at one candle per pixel column, whatever the series holds.
+(Details, and why ImPlot could not express this, live in `05-ui.md` §2.)
 
 ---
 

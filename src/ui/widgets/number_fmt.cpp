@@ -112,6 +112,10 @@ const char* format_px(Px value, uint8_t sz_decimals, char* out, size_t cap) noex
     return format_scaled(value, decimals, /*grouped=*/false, /*dollar_sign=*/false, out, cap);
 }
 
+const char* format_px_decimals(Px value, int decimals, char* out, size_t cap) noexcept {
+    return format_scaled(value, decimals, /*grouped=*/false, /*dollar_sign=*/false, out, cap);
+}
+
 const char* format_qty(Qty value, uint8_t sz_decimals, char* out, size_t cap) noexcept {
     const int decimals = static_cast<int>(std::min<uint8_t>(sz_decimals, 8));
     return format_scaled(value, decimals, /*grouped=*/false, /*dollar_sign=*/false, out, cap);
@@ -154,6 +158,53 @@ const char* format_pct(int64_t value_1e8, int decimals, char* out, size_t cap) n
     } else {
         out[copy_n] = '\0';
     }
+    return out;
+}
+
+const char* format_count(int64_t value, char* out, size_t cap) noexcept {
+    if (cap == 0)
+        return out;
+    // Avoid UB on INT64_MIN, the same way format_scaled does.
+    const bool negative = value < 0;
+    const uint64_t magnitude =
+        negative ? static_cast<uint64_t>(-(value + 1)) + 1 : static_cast<uint64_t>(value);
+    char buf[32];
+    size_t pos = 0;
+    if (negative)
+        buf[pos++] = '-';
+    pos += static_cast<size_t>(write_grouped(magnitude, buf + pos));
+    const size_t n = std::min(pos, cap - 1);
+    for (size_t i = 0; i < n; ++i)
+        out[i] = buf[i];
+    safe_terminate(out, cap, pos);
+    return out;
+}
+
+const char* format_duration(uint64_t ms, char* out, size_t cap) noexcept {
+    if (cap == 0)
+        return out;
+    const uint64_t total = ms / 1000;
+    const uint64_t days = total / 86400;
+    const uint64_t hours = (total % 86400) / 3600;
+    const uint64_t minutes = (total % 3600) / 60;
+    const uint64_t seconds = total % 60;
+    if (days > 0 && hours > 0)
+        std::snprintf(out, cap, "%llud %lluh", static_cast<unsigned long long>(days),
+                      static_cast<unsigned long long>(hours));
+    else if (days > 0)
+        std::snprintf(out, cap, "%llud", static_cast<unsigned long long>(days));
+    else if (hours > 0 && minutes > 0)
+        std::snprintf(out, cap, "%lluh %llum", static_cast<unsigned long long>(hours),
+                      static_cast<unsigned long long>(minutes));
+    else if (hours > 0)
+        std::snprintf(out, cap, "%lluh", static_cast<unsigned long long>(hours));
+    else if (minutes > 0 && seconds > 0)
+        std::snprintf(out, cap, "%llum %llus", static_cast<unsigned long long>(minutes),
+                      static_cast<unsigned long long>(seconds));
+    else if (minutes > 0)
+        std::snprintf(out, cap, "%llum", static_cast<unsigned long long>(minutes));
+    else
+        std::snprintf(out, cap, "%llus", static_cast<unsigned long long>(seconds));
     return out;
 }
 

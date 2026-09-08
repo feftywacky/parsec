@@ -58,7 +58,7 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------------------------
-# parsec_ui — ImGui/ImPlot frontend. Reads engine snapshots only; never touches pc_* directly.
+# parsec_ui — ImGui frontend. Reads engine snapshots only; never touches pc_* directly.
 # ---------------------------------------------------------------------------------------------
 file(GLOB PARSEC_UI_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ui/*.cpp
@@ -69,7 +69,7 @@ target_include_directories(parsec_ui PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(parsec_ui PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(parsec_ui PUBLIC parsec_core implot imgui glfw OpenGL::GL)
+target_link_libraries(parsec_ui PUBLIC parsec_core imgui glfw OpenGL::GL)
 if(APPLE)
     target_compile_definitions(parsec_ui PUBLIC GL_SILENCE_DEPRECATION)
 endif()

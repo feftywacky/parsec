@@ -13,7 +13,7 @@ edge, Dear ImGui interface. One binary, no browser, no runtime.
 | 02 | [`02-architecture.md`](02-architecture.md) | process/thread topology, FFI contract, C++ module design |
 | 03 | [`03-hyperliquid-api.md`](03-hyperliquid-api.md) | verified exchange facts: endpoints, payloads, signing, limits |
 | 04 | [`04-rust-layer.md`](04-rust-layer.md) | the Rust crate: transport, codec, signer, FFI implementation |
-| 05 | [`05-ui.md`](05-ui.md) | ImGui/ImPlot layout, chart and book rendering, interactions |
+| 05 | [`05-ui.md`](05-ui.md) | ImGui layout, chart and book rendering, interactions |
 | 06 | [`06-security.md`](06-security.md) | key custody, agent wallets, keystore format, threat model |
 | 07 | [`07-implementation-plan.md`](07-implementation-plan.md) | phased build order, file-by-file, acceptance criteria |
 | 08 | [`08-testing.md`](08-testing.md) | unit, signing-vector, replay, and testnet test strategy |
@@ -89,7 +89,7 @@ taking down a C++ core that may be holding resting orders. Doc 04 §5.2.
 | Network/crypto | Rust `staticlib`, tokio + **rustls** | rustc 1.96 — rustls drops all three macOS frameworks from the link line |
 | Signing | `k256` + `sha3` + `rmp-serde` | 51 crates, 10 s builds, vectors verified |
 | UI | Dear ImGui **docking branch** | `v1.92.9b-docking` (`1.93.0 WIP`) — docking is not in master |
-| Charts | ImPlot + copied `PlotCandlestick` + LOD | `v1.0` (2026-04-05) — candlesticks are demo code, not API |
+| Charts | hand-rolled on `ImDrawList`, bar-index axis | no charting library — 05 §2.1 for why ImPlot could not express this |
 | Windowing | GLFW + OpenGL3 backend | `3.5.1` |
 | Build | CMake 4.1 + FetchContent + Corrosion | ✅ configures and builds end-to-end |
 | Tests | doctest (C++), `cargo test` (Rust), replay harness | see 08 |
@@ -98,7 +98,7 @@ Measured build weight (macOS arm64): thin Rust layer = **180 crates, 44 s** clea
 versus **411 crates, 2 m 10 s** for the official-SDK stack.
 
 Already present locally: clang 21, cmake 4.1, rustc/cargo 1.96, glfw, nlohmann-json, boost,
-openssl@3. Missing: ninja (optional); imgui/implot/doctest are fetched by CMake.
+openssl@3. Missing: ninja (optional); imgui/doctest are fetched by CMake.
 
 ### Verified prototypes in this repo
 

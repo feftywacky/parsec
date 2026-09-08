@@ -31,14 +31,6 @@ FetchContent_Declare(imgui
     GIT_SHALLOW    TRUE)
 
 # ---------------------------------------------------------------------------------------------
-# ImPlot
-# ---------------------------------------------------------------------------------------------
-FetchContent_Declare(implot
-    GIT_REPOSITORY https://github.com/epezent/implot.git
-    GIT_TAG        v1.0
-    GIT_SHALLOW    TRUE)
-
-# ---------------------------------------------------------------------------------------------
 # nlohmann/json — config and CLI only, never on the hot path (docs/05-ui.md §5.3)
 # ---------------------------------------------------------------------------------------------
 FetchContent_Declare(json
@@ -54,7 +46,7 @@ FetchContent_Declare(doctest
     GIT_TAG        v2.4.12
     GIT_SHALLOW    TRUE)
 
-FetchContent_MakeAvailable(glfw imgui implot json doctest)
+FetchContent_MakeAvailable(glfw imgui json doctest)
 find_package(OpenGL REQUIRED)
 
 # imgui ships no CMakeLists.txt of its own — build it ourselves as a static lib. We use the
@@ -75,15 +67,6 @@ target_link_libraries(imgui PUBLIC glfw OpenGL::GL)
 if(APPLE)
     target_compile_definitions(imgui PUBLIC GL_SILENCE_DEPRECATION)
 endif()
-
-# implot_demo.cpp is kept and built: it is the source of `MyImPlot::PlotCandlestick`, which
-# docs/05-ui.md §2.2 says to copy into src/ui/widgets/candles.cpp rather than reimplement.
-add_library(implot STATIC
-    ${implot_SOURCE_DIR}/implot.cpp
-    ${implot_SOURCE_DIR}/implot_items.cpp
-    ${implot_SOURCE_DIR}/implot_demo.cpp)
-target_include_directories(implot PUBLIC ${implot_SOURCE_DIR})
-target_link_libraries(implot PUBLIC imgui)
 
 # ---------------------------------------------------------------------------------------------
 # Corrosion — imports the Rust staticlib as a CMake target (docs/04-rust-layer.md §5.4)

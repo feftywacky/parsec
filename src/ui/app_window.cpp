@@ -5,7 +5,6 @@
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 #include <imgui_internal.h>  // ImGui::DockBuilder* — internal API, needed for the default layout
-#include <implot.h>
 
 #include <cstdio>
 
@@ -203,7 +202,6 @@ int AppWindow::run() {
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImPlot::CreateContext();
 
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
@@ -399,7 +397,6 @@ int AppWindow::run() {
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
-    ImPlot::DestroyContext();
     ImGui::DestroyContext();
 
     glfwDestroyWindow(window_);

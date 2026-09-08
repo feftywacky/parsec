@@ -171,7 +171,7 @@ schedule.
 - The venue's own correctness. If `clearinghouseState` and `userFills` disagree, that is
   reconciliation's job to surface, not a test's job to assert.
 - UI pixel output. Panels are thin readers over snapshots; the snapshots are tested instead.
-- Third-party library internals (ImGui, ImPlot, tokio). Pinned versions, and upgrades get a
+- Third-party library internals (ImGui, tokio). Pinned versions, and upgrades get a
   manual smoke pass.
 
 ## Slow security tests
