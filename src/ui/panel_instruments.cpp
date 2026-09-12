@@ -390,8 +390,8 @@ void draw_instruments(PanelContext& ctx) {
 
         // docs/09-measurements.md §2.1-2.2: funding/OI/volume/mark/oracle were observed
         // parsing as zero on testnet earlier in development, due to a decimal-precision bug
-        // and a nesting bug in the Rust edge parser (both since fixed, per §2.2's
-        // `verify_phase1.rs` sample output). If these columns still read 0 at runtime in this
+        // and a nesting bug in the Rust edge parser (both since fixed).
+        // If these columns still read 0 at runtime in this
         // build, that is an upstream regression to report against rust/src/codec, not a bug in
         // this panel -- it renders exactly what AssetCtx is given.
     }
