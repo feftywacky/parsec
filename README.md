@@ -1,62 +1,58 @@
 # Parsec
 
-A fast, minimal native trading terminal for Hyperliquid perpetuals.
+**A fast lightweight trading client for Hyperliquid perpetuals.**
 
-C++20 trading core, Rust network/signing edge, Dear ImGui interface. One binary, no browser,
-no runtime.
+One small binary. No browser, no Electron, no web stack. Keys are kept on your machine.
 
-## Build and run
+![Parsec main window](assets/parsec.png)
 
-Requires a C++20 compiler and Rust (stable).
+## Getting started
+
+You need a C++20 compiler and a stable Rust toolchain.
 
 ```sh
 cmake -S . -B build
 cmake --build build
-./build/parsec              # mainnet by default
-./build/parsec --testnet    # testnet
+./build/parsec             # mainnet
+./build/parsec --testnet   # testnet
 ```
 
-Run the checks with `cargo test` from `rust/` and `ctest --test-dir build`.
+### Connecting your account
 
-## Documents
+On first launch Parsec asks you to connect an account:
 
-| # | Document | What it answers |
+1. Paste your wallet private key and pick a passphrase.
+2. Parsec creates a new agent wallet and uses your key for a single signature to approve it.
+3. Your key is wiped from memory right away. Only the agent key is saved, encrypted, in
+   your `~/.parsec` folder (readable only by you).
+
+After that, you unlock Parsec with your passphrase. Your main key is never stored, logged,
+or passed on the command line.
+
+## How it is built
+
+| Part | Language | Job |
 |---|---|---|
-| 01 | [Overview](docs/01-overview.md) | scope, requirements, decisions, stack |
-| 02 | [Architecture](docs/02-architecture.md) | process/thread topology, FFI contract, C++ modules |
-| 03 | [Hyperliquid API](docs/03-hyperliquid-api.md) | verified exchange facts: REST, WebSocket, signing, limits |
-| 04 | [Rust layer](docs/04-rust-layer.md) | transport, codec, signer, the C ABI header |
-| 05 | [UI](docs/05-ui.md) | ImGui layout, chart and book rendering |
-| 06 | [Security](docs/06-security.md) | key custody, agent wallets, keystore, threat model |
-| 07 | [Implementation plan](docs/07-implementation-plan.md) | phased build order with acceptance criteria |
-| 08 | [Testing](docs/08-testing.md) | unit, signing-vector, replay, and testnet strategy |
+| Trading core | C++20 | market data, order state, risk, portfolio math |
+| Network edge | Rust | WebSocket and REST, message decoding, order signing |
+| Interface | Dear ImGui | charts, book, ticket, positions |
 
-## Prototypes
+The Rust side talks to the C++ side through a small C interface and lock free queues, so the
+screen never waits on the network.
 
-Verified, runnable starting points produced during design research:
+Signing is checked against Hyperliquid's official test vectors.
 
-- `prototypes/signing-vectors/` — reproduces Hyperliquid's official signature test vectors
-  byte-for-byte (`cargo run --release`).
-- `prototypes/ffi-demo/` — working CMake + Corrosion + tokio staticlib linked into a C++ binary.
+**Direct to the exchange.** Parsec connects straight to Hyperliquid's public API. No hosted
+website or third party server sits between you and your orders.
+
+## Tests
+
+```sh
+cd rust && cargo test
+ctest --test-dir build
+```
 
 ## Scope
 
-Hyperliquid **perpetuals only**. Market and limit orders, leverage, TP/SL, cross and isolated
-margin, live positions and portfolio, order book and candle charts. Mainnet is the default;
-pass `--testnet` to use testnet. Select the active coin from the in-app coin picker.
-
-Trading keys are **agent wallets** — they can trade but cannot withdraw. The master key is
-used once, to approve the agent, and is never stored. See [`docs/06-security.md`](docs/06-security.md).
-
-## Signing in
-
-On first launch, parsec offers to **connect an account**. You give it your MetaMask private
-key and choose a keystore passphrase. It generates a fresh agent wallet, uses your key for one
-signature to approve that agent, zeroes the key, and writes `~/.parsec/keystore-<network>.json`
-(mode 0600) holding only the encrypted agent key.
-
-Your MetaMask key is never stored, logged, or passed as an argument. It exists in the
-process only for that one signature. Hyperliquid has no usernames or passwords; an account
-*is* a keypair, so that signature is the only proof the account is yours and the only way to
-authorize the agent to trade for it.
-</content>
+Parsec supports Hyperliquid **perpetuals only**. Spot trading and deposits/withdrawals are not
+supported yet.
