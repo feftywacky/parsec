@@ -8,3 +8,5 @@ target/
 .parsec/
 keystore*
 *.key
+/docs/
+/prototypes/
