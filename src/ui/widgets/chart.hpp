@@ -25,8 +25,8 @@ const char* chart_style_label(ChartStyle style) noexcept;
 // The ruler: drag out a box and read what the move was worth. Held in the view state because a
 // measurement survives the drag that made it -- the point is to read it afterwards.
 struct ChartMeasure {
-    bool armed{false};  // the toolbar button: the next drag measures instead of panning
-    bool dragging{false};
+    bool armed{false};  // the toolbar button: the next click measures instead of panning
+    bool dragging{false};  // the far corner is following the cursor, awaiting the pinning click
     bool shown{false};
     // Bar indices, which may fall outside the series: measuring into the empty pane to the
     // right of the last bar is a normal thing to want (how long until this reaches that level).

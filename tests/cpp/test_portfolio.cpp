@@ -45,6 +45,49 @@ TEST_CASE("realized_pnl_from_fill: fee already includes builderFee, no double co
 
 // --- account_state.hpp ---------------------------------------------------------------------
 
+namespace {
+pc_fill test_fill(bool is_buy, Qty qty, Usd closed_pnl, Usd fee) {
+    pc_fill f{};
+    f.is_buy = is_buy;
+    f.qty = qty;
+    f.closed_pnl = closed_pnl;
+    f.fee = fee;
+    return f;
+}
+}  // namespace
+
+TEST_CASE("realized_since_open: a prior position's closes are not charged to this one") {
+    // Newest first: two opening sells for a 0.1452 short, then (older) the close of a long
+    // that lost $1000. Only the two opening fees belong to the short.
+    const pc_fill a = test_fill(false, kScale / 10, 0, kScale);
+    const pc_fill b = test_fill(false, 452 * kScale / 10'000, 0, kScale / 2);
+    const pc_fill c = test_fill(false, kScale, -1'000 * kScale, 2 * kScale);
+    const pc_fill* fills[] = {&a, &b, &c};
+    const PositionRealized r = realized_since_open(-1452 * kScale / 10'000, fills, 3);
+    CHECK(r.pnl == -(kScale + kScale / 2));
+    CHECK(r.fees == kScale + kScale / 2);
+    CHECK(r.fills == 2);
+    CHECK(r.complete);
+}
+
+TEST_CASE("realized_since_open: a flip keeps only its opening share of the fee") {
+    // Sold 3 while long 2 -> short 1. closed_pnl is the long's; 1/3 of the fee is the short's.
+    const pc_fill flip = test_fill(false, 3 * kScale, 50 * kScale, 3 * kScale);
+    const pc_fill* fills[] = {&flip};
+    const PositionRealized r = realized_since_open(-kScale, fills, 1);
+    CHECK(r.pnl == -kScale);
+    CHECK(r.fees == kScale);
+    CHECK(r.complete);
+}
+
+TEST_CASE("realized_since_open: history that stops short of the open is flagged partial") {
+    const pc_fill add = test_fill(false, kScale, 0, kScale);
+    const pc_fill* fills[] = {&add};
+    const PositionRealized r = realized_since_open(-2 * kScale, fills, 1);
+    CHECK(r.pnl == -kScale);
+    CHECK_FALSE(r.complete);
+}
+
 TEST_CASE("AccountState: authoritative snapshot re-bases the optimistic view") {
     AccountState acct;
     CHECK_FALSE(acct.has_snapshot());

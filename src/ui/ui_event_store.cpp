@@ -61,6 +61,24 @@ bool UiEventStore::claim_fill_tid(uint64_t tid) noexcept {
     return true;
 }
 
+portfolio::PositionRealized UiEventStore::position_realized(uint32_t asset,
+                                                            Qty szi) const noexcept {
+    // Arrival order is not time order (the REST backfill replays newest-first, interleaved
+    // with the live stream), so this coin's fills are sorted by venue time before the walk.
+    std::array<const FillRow*, kMaxFills> mine{};
+    size_t n = 0;
+    for (size_t i = 0; i < fill_count_; ++i) {
+        const FillRow& f = fill_at(i);
+        if (f.asset == asset)
+            mine[n++] = &f;
+    }
+    std::sort(mine.begin(), mine.begin() + static_cast<std::ptrdiff_t>(n),
+              [](const FillRow* a, const FillRow* b) {
+                  return a->time_ms != b->time_ms ? a->time_ms > b->time_ms : a->tid > b->tid;
+              });
+    return portfolio::realized_since_open(szi, mine.data(), n);
+}
+
 void UiEventStore::on_fill(uint32_t asset, const pc_fill& f, uint64_t t,
                            uint64_t exch_time_ms) noexcept {
     if (!claim_fill_tid(f.tid))
@@ -108,8 +126,12 @@ void UiEventStore::on_ack(uint32_t asset, const pc_order_ack& a, uint64_t t) noe
         return;
 
     ToastRow toast{};
-    std::snprintf(toast.text, sizeof(toast.text), "order %llu rejected: %s",
-                  static_cast<unsigned long long>(a.oid), a.err);
+    // A rejected order was never assigned an oid, so printing it only ever said "order 0".
+    if (a.oid != 0)
+        std::snprintf(toast.text, sizeof(toast.text), "order %llu rejected: %s",
+                      static_cast<unsigned long long>(a.oid), a.err);
+    else
+        std::snprintf(toast.text, sizeof(toast.text), "order rejected: %s", a.err);
     toast.severity = 2;
     toast.recv_time_ns = t;
     push_toast(toast);

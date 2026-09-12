@@ -42,6 +42,10 @@ struct TicketPrefs {
     bool size_in_usd{false};
     float pct_slider{0.0F};
     bool tpsl_enabled{false};
+    // TP/SL legs fire as limit orders at their trigger price instead of market orders. A limit
+    // leg gets maker pricing and no slippage, at the cost of possibly not filling if the price
+    // gaps through it -- which is why it is opt-in rather than the default for a stop.
+    bool tpsl_limit{false};
     char tp_buf[32]{};
     char sl_buf[32]{};
     // What unit tp_buf/sl_buf are written in. Per-field, because the two legs are naturally
@@ -193,6 +197,35 @@ Px blended_entry(Px old_entry, Qty old_size, Px new_entry, Qty new_size) noexcep
                             total);
 }
 
+ImVec4 shade(ImVec4 c, float k) noexcept {
+    // k > 0 lightens toward white, k < 0 darkens toward black; alpha untouched.
+    auto ch = [k](float v) { return k >= 0 ? v + (1.0F - v) * k : v * (1.0F + k); };
+    return ImVec4(ch(c.x), ch(c.y), ch(c.z), c.w);
+}
+
+// Every clickable button on the ticket goes through here so they all answer the pointer the
+// same way: a lighter fill and a thin outline on hover, a darker fill while held, and the hand
+// cursor. Without the hover cue the flat fills gave no hint which blocks were buttons.
+bool ticket_button(const char* label, ImVec2 size, ImVec4 fill, ImVec4 text) {
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0F);
+    ImGui::PushStyleColor(ImGuiCol_Button, fill);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, shade(fill, 0.14F));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, shade(fill, -0.18F));
+    ImGui::PushStyleColor(ImGuiCol_Text, text);
+    const bool clicked = ImGui::Button(label, size);
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar();
+    // IsItemHovered is false for disabled items by default, so disabled buttons stay inert.
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        ImVec4 edge = shade(fill, 0.35F);
+        edge.w = 0.9F;
+        ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                                            ImGui::GetColorU32(edge), 4.0F, 0, 1.0F);
+    }
+    return clicked;
+}
+
 }  // namespace
 
 void draw_ticket(PanelContext& ctx) {
@@ -310,21 +343,14 @@ void draw_ticket(PanelContext& ctx) {
     // The inactive fill is drawn explicitly so hover cannot fall back to ImGui's grey, which
     // on the side selector read as "this button is now Sell" mid-hover.
     const ImVec4 kSegmentIdle{0.086F, 0.145F, 0.169F, 1.0F};
-    const ImVec4 kSegmentHover{0.129F, 0.204F, 0.235F, 1.0F};
     // Neutral, deliberately colourless: green/red on this panel means long/short, and the
     // mode rows sit directly above the side selector. Tinting "Cross" or "Limit" teal made
     // three rows of green with one red half and read as though they were all side choices.
     const ImVec4 kSegmentOn{0.208F, 0.286F, 0.318F, 1.0F};
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0F);
     const float segment_w = std::max(64.0F, (panel_w - gap) * 0.5F);
     auto segment = [&](const char* label, bool active, ImVec4 on_fill, ImVec4 on_text) {
-        ImGui::PushStyleColor(ImGuiCol_Button, active ? on_fill : kSegmentIdle);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, active ? on_fill : kSegmentHover);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, active ? on_fill : kSegmentHover);
-        ImGui::PushStyleColor(ImGuiCol_Text, active ? on_text : kColorTextMuted);
-        const bool clicked = ImGui::Button(label, ImVec2(segment_w, 0));
-        ImGui::PopStyleColor(4);
-        return clicked;
+        return ticket_button(label, ImVec2(segment_w, 0), active ? on_fill : kSegmentIdle,
+                             active ? on_text : kColorTextMuted);
     };
 
     // Margin mode first: it is the account setting the rest of the ticket is priced under, and
@@ -359,7 +385,6 @@ void draw_ticket(PanelContext& ctx) {
     ImGui::SameLine();
     if (segment("Sell / Short", !ctx.view.ticket_is_buy, kColorAsk, kColorBg))
         ctx.view.ticket_is_buy = false;
-    ImGui::PopStyleVar();
 
     const Side side = ctx.view.ticket_is_buy ? Side::Buy : Side::Sell;
 
@@ -427,7 +452,7 @@ void draw_ticket(PanelContext& ctx) {
     // annoying to type, since it moves. Writes both the model and the buffer so the rest of
     // the frame (rounding, slippage, risk gate) sees the new price immediately.
     ImGui::BeginDisabled(live_mid <= 0);
-    if (ImGui::Button("Mid")) {
+    if (ticket_button("Mid", ImVec2(0, 0), kSegmentIdle, kColorTextPrimary)) {
         ctx.view.ticket_px = live_mid;
         format_px(live_mid, ctx.sz_decimals, g_prefs.px_buf, sizeof(g_prefs.px_buf));
     }
@@ -542,6 +567,14 @@ void draw_ticket(PanelContext& ctx) {
     ImGui::Checkbox("Reduce only", &ctx.view.ticket_reduce_only);
     ImGui::SameLine();
     ImGui::Checkbox("TP/SL", &g_prefs.tpsl_enabled);
+    if (g_prefs.tpsl_enabled) {
+        ImGui::SameLine();
+        ImGui::Checkbox("Limit TP/SL", &g_prefs.tpsl_limit);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Checked: each leg rests a limit order at its trigger price once\n"
+                              "triggered (no slippage, may not fill on a gap).\n"
+                              "Unchecked: each leg fires a market order.");
+    }
 
     // --- TP/SL legs ---------------------------------------------------------------------
     // Attached to both limit and market parents: the entry price a percentage is measured
@@ -1175,15 +1208,10 @@ void draw_ticket(PanelContext& ctx) {
     // silently does nothing. The text before "##" is still what gets drawn.
     const char* label = ctx.view.ticket_is_buy ? "Buy / Long##ticket_submit"
                                                : "Sell / Short##ticket_submit";
-    // Hover/active pinned to the same fill as the button: ImGui's defaults are a blue-grey
-    // that made the submit button flash a different colour than the side it is about to trade.
+    // Hover/active are shades of the side's own colour rather than ImGui's blue-grey defaults,
+    // which made the submit button flash a different colour than the side it is about to trade.
     const ImVec4 submit_fill = ctx.view.ticket_is_buy ? kColorBid : kColorAsk;
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0F);
-    ImGui::PushStyleColor(ImGuiCol_Button, submit_fill);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, submit_fill);
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, submit_fill);
-    ImGui::PushStyleColor(ImGuiCol_Text, kColorBg);
-    if (ImGui::Button(label, ImVec2(-1, 0))) {
+    if (ticket_button(label, ImVec2(-1, 0), submit_fill, kColorBg)) {
         pc_order main_order{};
         main_order.asset = ctx.instrument.asset;
         main_order.is_buy = ctx.view.ticket_is_buy ? 1 : 0;
@@ -1213,8 +1241,16 @@ void draw_ticket(PanelContext& ctx) {
                 child.tif = PC_TIF_GTC;
                 child.tpsl = kind;
                 child.trigger_px = leg.trigger;
-                child.limit_px = leg.trigger;
-                child.is_market_trigger = 1;
+                child.is_market_trigger = g_prefs.tpsl_limit ? 0 : 1;
+                // A limit leg rests at its trigger. A market leg's limit price is the venue's
+                // slippage bound once it fires, so it gets marketable padding -- a bound equal
+                // to the trigger makes a stop unfillable in the fast market it exists for.
+                child.limit_px =
+                    g_prefs.tpsl_limit
+                        ? leg.trigger
+                        : exec::Rounder::marketable_px(
+                              leg.trigger, ctx.view.ticket_is_buy ? Side::Sell : Side::Buy,
+                              precision);
                 child.sz = final_sz;
                 make_local_cloid(child.cloid, ctx.now_ms + cloid_salt);
                 req.orders[req.n_orders++] = child;
@@ -1242,6 +1278,13 @@ void draw_ticket(PanelContext& ctx) {
                           ctx.view.ticket_market ? " (market)" : "",
                           child_legs > 0 ? " + TP/SL" : "");
             g_prefs.submit_note_error = false;
+            // Clear the size once the order is away. Leaving it in place kept the ticket
+            // previewing a second, identical order against free margin that the first one's
+            // resting hold had just consumed -- so a successfully placed order was followed
+            // by "Blocked: needs X USDC more margin", which read as the order having failed.
+            ctx.view.ticket_sz = 0;
+            g_prefs.sz_buf[0] = '\0';
+            g_prefs.pct_slider = 0.0F;
             // Also logged, so the Status tab keeps the session's full order history.
             event_store().note_local(g_prefs.submit_note, 0);
         } else {
@@ -1252,8 +1295,6 @@ void draw_ticket(PanelContext& ctx) {
         }
         g_prefs.submit_note_ms = ctx.now_ms;
     }
-    ImGui::PopStyleColor(4);
-    ImGui::PopStyleVar();
     ImGui::EndDisabled();
 
     // Mirror any new warning/error toast into the note area. Placed after the submit handler so

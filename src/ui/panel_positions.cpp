@@ -150,6 +150,8 @@ struct PositionsPrefs {
     // 2.10" but "never lose more than 20% of the margin").
     TpSlUnit tp_unit{TpSlUnit::Price};
     TpSlUnit sl_unit{TpSlUnit::Price};
+    // Legs fire as limit orders at their trigger price rather than as market orders.
+    bool limit{false};
     // How much of the position each leg closes. Blank means all of it, so the common
     // full-exit case needs nothing typed.
     char tp_sz_buf[32]{};
@@ -323,7 +325,7 @@ PositionLeg resolve_leg(const char* text, TpSlUnit unit, bool is_tp, const pc_po
 // ordinary standalone reduce-only trigger, so it goes ungrouped; sending it as positionTpsl
 // would ask the venue to resize it back up to the full position behind the trader's back.
 void submit_tpsl(PanelContext& ctx, const portfolio::Position& row, const RowView& view,
-                 const PositionLeg& tp, const PositionLeg& sl) {
+                 const PositionLeg& tp, const PositionLeg& sl, bool limit) {
     const exec::AssetPrecision precision{view.sz_decimals};
     const bool is_long = row.value.szi > 0;
     const Side close_side = is_long ? Side::Sell : Side::Buy;
@@ -342,12 +344,14 @@ void submit_tpsl(PanelContext& ctx, const portfolio::Position& row, const RowVie
         child.tif = PC_TIF_GTC;
         child.tpsl = kind;
         child.trigger_px = leg.trigger;
-        child.is_market_trigger = 1;
-        // A market trigger still carries a limit price, and the venue uses it as the slippage
-        // bound once the trigger fires. Setting it to the trigger itself (which is what a
-        // naive reading suggests) makes the stop unfillable in exactly the fast market it
-        // exists for, so it gets the same marketable padding a close order does.
-        child.limit_px = exec::Rounder::marketable_px(leg.trigger, close_side, precision);
+        child.is_market_trigger = limit ? 0 : 1;
+        // A limit leg rests at its trigger. A market trigger still carries a limit price, and
+        // the venue uses it as the slippage bound once the trigger fires. Setting it to the
+        // trigger itself (which is what a naive reading suggests) makes the stop unfillable in
+        // exactly the fast market it exists for, so it gets the same marketable padding a
+        // close order does.
+        child.limit_px = limit ? leg.trigger
+                               : exec::Rounder::marketable_px(leg.trigger, close_side, precision);
         child.sz = leg.sz;
         make_local_cloid(child.cloid, ctx.now_ms + cloid_salt);
         req.orders[req.n_orders++] = child;
@@ -448,7 +452,7 @@ void draw_positions(PanelContext& ctx) {
     // both windows rather than the strip implying a single clean one.
     //
     // The per-position Funding COLUMN is a third figure again -- the venue's
-    // cumFunding.allTime for that one position -- and must not be substituted here.
+    // cumFunding.sinceOpen for that one position -- and must not be substituted here.
     const Usd funding_total = event_store().funding_total();
     const Usd session_realized = realized_total.pnl + funding_total;
 
@@ -485,7 +489,7 @@ void draw_positions(PanelContext& ctx) {
             "The two legs cover different windows, which is a limit of what the venue\n"
             "serves: fills backfill the most recent ones with no time bound, funding\n"
             "backfills a fixed 30 days. Both run forward live from there.\n\n"
-            "The per-position Funding column is a THIRD figure -- cumFunding.allTime for\n"
+            "The per-position Funding column is a THIRD figure -- cumFunding.sinceOpen for\n"
             "that one position -- so it will not tie out against the funding line here.",
             closed, realized_total.fills, fees, funding, buf);
     }
@@ -584,8 +588,8 @@ void draw_positions(PanelContext& ctx) {
                     break;
                 case 6:
                     header_with_tooltip(name,
-                                        "Closed P&L net of fees, accumulated from the fills\n"
-                                        "this session has seen for this coin. Not lifetime.");
+                                        "Closed P&L net of fees since this position opened,\n"
+                                        "from the fills this session has seen. Not lifetime.");
                     break;
                 case 7:
                     header_with_tooltip(name,
@@ -612,10 +616,10 @@ void draw_positions(PanelContext& ctx) {
                     break;
                 case 10:
                     header_with_tooltip(name,
-                                        "Funding settled on this position, all-time, as P&L:\n"
-                                        "positive is funding you RECEIVED, negative is funding\n"
-                                        "you paid.\n\n"
-                                        "This is the venue's cumFunding.allTime with its sign\n"
+                                        "Funding settled on this position since it opened, as\n"
+                                        "P&L: positive is funding you RECEIVED, negative is\n"
+                                        "funding you paid.\n\n"
+                                        "This is the venue's cumFunding.sinceOpen with its sign\n"
                                         "flipped -- that field counts funding paid, so it\n"
                                         "reports a credit as a negative number.");
                     break;
@@ -630,7 +634,8 @@ void draw_positions(PanelContext& ctx) {
             const portfolio::Position& row = ctx.portfolio.positions[i];
             const pc_position& p = row.value;
             const RowView view = resolve_row(ctx, row);
-            const RealizedRow& realized = event_store().realized(row.asset);
+            const portfolio::PositionRealized realized =
+                event_store().position_realized(row.asset, p.szi);
 
             // Keyed by asset, not by row index: the snapshot is rebuilt every few seconds and
             // a position closing elsewhere in the list shifts every index after it, which
@@ -690,16 +695,20 @@ void draw_positions(PanelContext& ctx) {
                     // this one to be read against it. Those two facts call for different
                     // responses, so the row keeps them apart.
                     ImGui::SetTooltip(
-                        "Closed P&L net of fees: %s in fees over %u fills this session.\n"
-                        "Only counts size actually closed -- while the position is open this\n"
-                        "is just the fees paid to open it.\n\n"
+                        "Closed P&L net of fees since this position opened (from flat, or\n"
+                        "flipped side): %s in fees over %u fills. Earlier positions in this\n"
+                        "coin are not counted. Until any size is closed this is just the\n"
+                        "fees paid to open it.%s\n\n"
                         "Trading only -- read it against the Funding column to the right to\n"
                         "separate entry/exit quality from carry.\n\n"
                         "Note these two do NOT sum to the Realized total on the strip above:\n"
-                        "that folds in funding from `userFunding` (30 days, account-wide),\n"
-                        "while the column beside this one is this position's all-time\n"
-                        "cumFunding. Different sources, different windows.",
-                        fees, realized.fills);
+                        "that is every fill this session plus `userFunding` (30 days,\n"
+                        "account-wide); these columns cover only the open position.",
+                        fees, realized.fills,
+                        realized.complete
+                            ? ""
+                            : "\n\nPartial: the fill that opened this position is older than\n"
+                              "this session's fill history, so earlier closes are missing.");
                 }
             } else {
                 ImGui::TextDisabled("--");
@@ -729,7 +738,7 @@ void draw_positions(PanelContext& ctx) {
                 format_usd(portfolio::position_cost_basis(p), buf, sizeof(buf)));
 
             ImGui::TableNextColumn();
-            // Negated on purpose. The venue's `cumFunding.allTime` counts funding PAID, so a
+            // Negated on purpose. The venue's `cumFunding.sinceOpen` counts funding PAID, so a
             // credit arrives as a negative number -- the inverse of every other signed column
             // in this table, and the inverse of the funding figure on the summary strip above
             // (which is summed from `userFunding`, where the venue writes a payment as
@@ -791,11 +800,16 @@ void draw_positions(PanelContext& ctx) {
                 ImGui::Text("%s %s -- %s %s, entry %s", view.coin,
                             p.szi > 0 ? "long" : "short", size_buf, view.coin, entry_buf);
                 ImGui::TextDisabled(
-                    "Reduce-only market triggers. Leave a price blank to skip that leg,\n"
+                    "Reduce-only triggers. Leave a price blank to skip that leg,\n"
                     "a size blank to use the whole position. Place as many as you like --\n"
                     "this stays open so a scaled exit can be built one tranche at a time.\n"
                     "Trigger '%%' is a move of the position (leverage included); size '%%'\n"
                     "is a fraction of the position.");
+                ImGui::Checkbox("Limit TP/SL##position_tpsl_limit", &g_prefs.limit);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Checked: each leg rests a limit order at its trigger price\n"
+                                      "once triggered (no slippage, may not fill on a gap).\n"
+                                      "Unchecked: each leg fires a market order.");
 
                 // --- What is already protecting this position -------------------------------
                 // Built from the resting orders this session knows about, filtered to this
@@ -986,7 +1000,7 @@ void draw_positions(PanelContext& ctx) {
                                      (tp.present && !tp.valid) || (sl.present && !sl.valid);
                 ImGui::BeginDisabled(blocked);
                 if (ImGui::Button("Place")) {
-                    submit_tpsl(ctx, row, view, tp, sl);
+                    submit_tpsl(ctx, row, view, tp, sl, g_prefs.limit);
                     // Only the prices are cleared. The popup stays open and the size fields
                     // keep their value, which is what building a scaled exit actually looks
                     // like: same 25% slice, three different prices.

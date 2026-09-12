@@ -308,7 +308,9 @@ pub(crate) fn push_clearinghouse_state(
                 position_value: parse_scaled(&p.position_value).unwrap_or(0),
                 unrealized_pnl: parse_scaled(&p.unrealized_pnl).unwrap_or(0),
                 margin_used: parse_scaled(&p.margin_used).unwrap_or(0),
-                cum_funding: parse_scaled(&p.cum_funding.all_time).unwrap_or(0),
+                // `sinceOpen`, not `allTime`: allTime is the coin's lifetime total across every
+                // position ever held in it, which is not a property of the position on screen.
+                cum_funding: parse_scaled(&p.cum_funding.since_open).unwrap_or(0),
                 roe_bps,
                 leverage: p.leverage.value,
                 is_cross: (p.leverage.kind == "cross") as u8,

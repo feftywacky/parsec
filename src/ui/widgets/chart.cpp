@@ -355,11 +355,15 @@ void draw_chart_widget(ChartState& s, const ChartInput& in) {
     };
 
     // --- the ruler ---------------------------------------------------------------------
-    // Shift+drag measures, which is the gesture every charting tool has; the toolbar button
-    // arms the same thing for one drag, for people who would rather not hold a modifier.
+    // Shift+click (or the armed toolbar button) starts a measurement; the box then follows the
+    // cursor with no button held, and a second click pins it. Dragging and releasing still
+    // works too, for hands that expect it.
     ChartMeasure& ruler = s.measure;
     if (plot_activated) {
-        if (ruler.armed || io.KeyShift) {
+        if (ruler.dragging) {
+            ruler.dragging = false;
+            ruler.armed = false;  // one-shot, like every other chart's ruler button
+        } else if (ruler.armed || io.KeyShift) {
             ruler.dragging = true;
             ruler.shown = true;
             ruler.from_index = static_cast<long>(std::llround(bar_under(io.MousePos.x)));
@@ -372,18 +376,21 @@ void draw_chart_widget(ChartState& s, const ChartInput& in) {
         }
     }
     if (ruler.dragging) {
-        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            ruler.to_index = static_cast<long>(std::llround(bar_under(io.MousePos.x)));
-            ruler.to_price = static_cast<Px>(
-                std::llround(price_under(io.MousePos.y) * static_cast<double>(kScale)));
-        } else {
+        ruler.to_index = static_cast<long>(std::llround(bar_under(io.MousePos.x)));
+        ruler.to_price = static_cast<Px>(
+            std::llround(price_under(io.MousePos.y) * static_cast<double>(kScale)));
+        // A real drag (past the same 4px threshold panning uses) ends on release; a plain
+        // click leaves the box following the cursor until the next click.
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+            io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Left] > 16.0F) {
             ruler.dragging = false;
-            ruler.armed = false;  // one-shot, like every other chart's ruler button
+            ruler.armed = false;
         }
     }
     if (ImGui::IsWindowFocused() && ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         ruler.shown = false;
         ruler.armed = false;
+        ruler.dragging = false;
     }
 
     // Wheel zooms the time axis about the bar under the cursor, TradingView's default. It never

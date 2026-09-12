@@ -16,12 +16,14 @@
 // UiEvent::asset, and every row below copies it, so a fill/order row can name its own coin and
 // a per-row action (cancel, close) targets the asset the row is actually about rather than
 // whichever instrument happens to be on screen.
+#include <algorithm>
 #include <array>
 #include <cstdint>
 
 #include "app/ui_bridge.hpp"
 #include "core/units.hpp"
 #include "parsec/parsec.h"
+#include "portfolio/pnl.hpp"
 
 namespace pc::ui {
 
@@ -134,6 +136,12 @@ public:
         return asset < kMaxAssets ? realized_[asset] : kEmpty;
     }
     [[nodiscard]] const RealizedRow& realized_total() const noexcept { return realized_total_; }
+
+    // Realized P&L of the position now open in `asset` (signed size `szi`): only the fills
+    // since it opened from flat or flipped, not every fill the coin has had this session.
+    // See portfolio::realized_since_open.
+    [[nodiscard]] portfolio::PositionRealized position_realized(uint32_t asset,
+                                                                Qty szi) const noexcept;
 
     [[nodiscard]] size_t fill_count() const noexcept { return fill_count_; }
     [[nodiscard]] const FillRow& fill_at(size_t i) const noexcept {
